@@ -1,0 +1,13 @@
+[project]
+name = "ocr-stream"
+version = "0.1.0"
+description = "Real-time OCR on a cv2 stream with PP-OCRv6 tiny (ONNX Runtime)"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "paddleocr>=3.5",
+    # CPU. For NVIDIA GPU: swap the first line for "onnxruntime-gpu".
+    # 1.19.2 is the last onnxruntime release with an Intel-Mac (x86_64) wheel.
+    "onnxruntime>=1.20; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "onnxruntime==1.19.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "numpy",
+]
