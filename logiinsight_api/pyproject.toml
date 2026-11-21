@@ -1,0 +1,35 @@
+[project]
+name = "logiinsight-api"
+version = "1.5.2"
+description = "PC-host Python SDK and examples for the LogiInsight / EPFL hackathon webcam (RGB + near-infrared streams, on-device AI data, microphone audio)."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    # SSH/SFTP link to the camera (AI JSON, INI config, YUV snapshots)
+    "paramiko>=3.0",
+    "numpy>=1.24",
+    # GUI build (NOT opencv-python-headless): the examples use cv2.imshow
+    "opencv-python>=4.8",
+    # Microphone: capture (PortAudio; Linux also needs the libportaudio2 system package),
+    # power spectrum + WAV export, and the PNG plots
+    "sounddevice>=0.4.6",
+    "scipy>=1.10.0",
+    "matplotlib>=3.7.0",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.5"]
+
+[tool.uv]
+# The SDK is a folder of plain scripts (logiwebcam.py, camera_utils.py,
+# example*.py), not an installable package: `uv sync` only
+# creates the virtualenv and installs the dependencies above.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = ["E501", "E701"]
