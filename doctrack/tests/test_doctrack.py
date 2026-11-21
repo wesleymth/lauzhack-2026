@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 from doctrack import (DocumentTracker, OpenCVDocumentDetector, estimate_aspect, order_corners, paper_size,
-                      quad_iou, refine_quad, warp_document)
+                      point_in_quad, quad_iou, refine_quad, warp_document)
 
 
 WOOD, WHITE, GREY = (40, 70, 110), (238, 238, 238), (200, 200, 200)
@@ -244,3 +244,115 @@ def test_estimate_aspect_under_perspective():
         q = x[:, :2] / x[:, 2:]
         assert abs(estimate_aspect(q, (W, H)) - 210 / 297) < 0.01
         assert paper_size(estimate_aspect(q, (W, H))) == (778, 1100)
+
+
+# --------------------------------------------------------------------------- #
+# hand selection (fake hands: no camera / MediaPipe needed)
+# --------------------------------------------------------------------------- #
+from doctrack.hands import DwellSelector, Hand  # noqa: E402
+
+
+def _hand(tip, pointing=True):
+    lm = np.tile(np.float32(tip), (21, 1)) + np.float32([0, -150])  # wrist side above the tip
+    lm[8] = tip
+    lm[0] = np.float32(tip) + [40, -250]
+    return Hand(lm.astype(np.float32), "Right", pointing)
+
+
+def _browse_ready():
+    tr = DocumentTracker(OpenCVDocumentDetector())
+    img = _scene([Q1, Q2])
+    _track_scene(lambda i: img, 15, tr)
+    assert len(tr.tracks) == 2
+    return tr, img
+
+
+def _run(tr, sel, img, tip, t0, secs, pointing=True, fps=30):
+    fired = None
+    for i in range(int(secs * fps)):
+        t = t0 + i / fps
+        hands = [_hand(tip, pointing)] if tip is not None else []
+        tr.update(img, t, occluders=[h.hull for h in hands])
+        fired = sel.update(tr, hands, t) or fired
+    return fired
+
+
+def test_point_one_second_selects_document():
+    tr, img = _browse_ready()
+    sel = DwellSelector()
+    target = next(t.id for t in tr.tracks if point_in_quad(t.corners, 250, 300))
+    assert _run(tr, sel, img, (250, 300), 1.0, 0.8) is None and not tr.locked   # not yet
+    assert _run(tr, sel, img, (250, 300), 1.8, 0.4) == target
+    assert tr.locked and tr.selected.id == target
+
+
+def test_non_pointing_hand_does_not_select():
+    tr, img = _browse_ready()
+    sel = DwellSelector()
+    assert _run(tr, sel, img, (250, 300), 1.0, 2.0, pointing=False) is None
+    assert not tr.locked
+
+
+def test_short_dropout_keeps_timer_moving_finger_resets():
+    tr, img = _browse_ready()
+    sel = DwellSelector()
+    _run(tr, sel, img, (250, 300), 1.0, 0.6)
+    _run(tr, sel, img, None, 1.6, 0.15)                     # hand lost for 0.15 s
+    assert _run(tr, sel, img, (250, 300), 1.75, 0.4) is not None
+    tr.clear_selection()
+    _track_scene(lambda i: img, 15, tr, 3.0)
+    sel2 = DwellSelector()
+    _run(tr, sel2, img, (250, 300), 4.0, 0.6)
+    assert _run(tr, sel2, img, (860, 350), 4.6, 0.6) is None  # moved to the other doc: restarts
+
+
+def test_no_reselect_until_finger_leaves_after_release():
+    tr, img = _browse_ready()
+    sel = DwellSelector()
+    assert _run(tr, sel, img, (250, 300), 1.0, 1.2) is not None
+    _run(tr, sel, img, (250, 300), 2.2, 0.2)                # locked; finger still there
+    tr.clear_selection()
+    _track_scene(lambda i: img, 15, tr, 2.5)
+    assert _run(tr, sel, img, (250, 300), 3.0, 2.0) is None  # still resting: no re-lock
+    _run(tr, sel, img, None, 5.0, 0.5)                       # finger leaves
+    assert _run(tr, sel, img, (250, 300), 5.5, 1.2) is not None
+
+
+def test_document_under_hand_stays_shown():
+    tr, img = _browse_ready()
+    tid = next(t.id for t in tr.tracks if point_in_quad(t.corners, 250, 300))
+    covered = img.copy()
+    arm = np.int32([[180, 0], [330, 0], [300, 330], [210, 330]])  # arm over the doc's top edge
+    cv2.fillConvexPoly(covered, arm, HAND)
+    before = next(t for t in tr.tracks if t.id == tid).corners.copy()
+    for i in range(90):                                       # 3 s with the hand on it
+        tr.update(covered, 2 + i / 30, occluders=[arm.astype(np.float32)])
+    t = next((t for t in tr.tracks if t.id == tid), None)
+    assert t is not None and np.abs(t.corners - before).max() < 3
+
+
+def test_rotate_and_mirror_scan_and_corners():
+    tr = _locked_tracker(QA, QB)
+    img = _scene([QA, QB], size=(1920, 1080))
+    base = tr.scan(img).astype(np.float32)
+    c0 = tr.selected.corners.copy()
+    tr.rotate()                                              # 90 deg clockwise
+    assert tr.scan_size == (1100, 778)
+    rot = tr.scan(img).astype(np.float32)
+    assert rot.shape[:2] == (778, 1100)
+    assert np.abs(rot - np.rot90(base, k=-1)).mean() < 3
+    np.testing.assert_array_equal(tr.selected.corners[0], c0[3])   # new TL = old BL
+    tr.rotate(3)                                             # back to the start
+    np.testing.assert_array_equal(tr.selected.corners, c0)
+    tr.toggle_mirror()
+    assert tr.mirrored and np.abs(tr.scan(img).astype(np.float32) - base[:, ::-1]).mean() < 3
+    tr.update(img, 5.0)                                      # survives tracking updates
+    assert np.abs(tr.selected.corners - c0[[1, 0, 3, 2]]).max() < 2
+    tr.clear_selection()
+    assert not tr.mirrored and tr.scan_size is None
+
+
+def test_scan_any_size():
+    tr = _locked_tracker(QA, QB)
+    img = _scene([QA, QB], size=(1920, 1080))
+    assert tr.scan(img, size=(640, 300)).shape[:2] == (300, 640)

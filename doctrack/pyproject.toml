@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Real-time document corner detection and tracking from a desk camera."
 requires-python = ">=3.9"
 dependencies = [
+    "mediapipe>=0.10.14",
     "numpy>=1.24",
     # GUI build (NOT headless): the app uses cv2.imshow
     "opencv-python>=4.8",

@@ -14,10 +14,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 from .filters import OneEuroFilter
-from .geometry import point_in_quad, quad_area, quad_iou
+from .geometry import point_in_quad, quad_area, quad_iou, warp_document
 from .locked import LockedTracker
 
 
@@ -59,6 +60,11 @@ class DocumentTracker:
         self._lock_track: Optional[Track] = None
         self._last_frame: Optional[np.ndarray] = None
         self._last_t = 0.0
+        # user correction of the locked document's orientation: which tracked
+        # corner is reported as TL, TR, BR, BL (rotation / mirror)
+        self._perm = np.arange(4)
+        self._quarter_turns = 0
+        self.mirrored = False
 
     # ------------------------------ selection API ------------------------- #
     @property
@@ -78,7 +84,30 @@ class DocumentTracker:
 
     @property
     def scan_size(self) -> Optional[Tuple[int, int]]:
-        return self._lock.scan_size if self._lock else None
+        """Default (w, h) of the scan: the paper size, swapped after a 90/270 deg rotation."""
+        if self._lock is None:
+            return None
+        w, h = self._lock.scan_size
+        return (h, w) if self._quarter_turns % 2 else (w, h)
+
+    def rotate(self, quarter_turns: int = 1) -> None:
+        """Correct the document's orientation by 90 deg clockwise steps: the corner
+        labels (and so the scan) turn with it."""
+        for _ in range(quarter_turns % 4):
+            self._perm = self._perm[[3, 0, 1, 2]]      # new TL = old BL
+            self._quarter_turns = (self._quarter_turns + 1) % 4
+        self._sync_lock_track()
+
+    def toggle_mirror(self) -> None:
+        """Mirror the document left-right (TL <-> TR, BL <-> BR)."""
+        self._perm = self._perm[[1, 0, 3, 2]]
+        self.mirrored = not self.mirrored
+        self._sync_lock_track()
+
+    def _sync_lock_track(self) -> None:
+        if self._lock is not None and self._lock_track is not None:
+            self._lock_track.corners = self._lock.corners[self._perm].copy()
+            self._lock_track.visible = self._lock.visible[self._perm].copy()
 
     def select(self, track_id: int) -> bool:
         t = self._tracks.get(track_id)
@@ -87,6 +116,7 @@ class DocumentTracker:
         self._lock = LockedTracker(self._last_frame, t.corners, self._last_t, paper=self.paper,
                                    scan_long_side=self.scan_long_side)
         self._lock_track = Track(t.id, self._lock.corners.copy(), t.score, t.hits)
+        self._reset_orientation()
         self._tracks.clear()  # stop tracking everything else
         return True
 
@@ -103,26 +133,37 @@ class DocumentTracker:
         self._lock = None
         self._lock_track = None
         self._tracks.clear()
+        self._reset_orientation()
 
-    def scan(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        """Flattened view of the locked document, always at `scan_size`."""
-        return self._lock.scan(frame) if self._lock is not None else None
+    def _reset_orientation(self) -> None:
+        self._perm, self._quarter_turns, self.mirrored = np.arange(4), 0, False
+
+    def scan(self, frame: np.ndarray, size: Optional[Tuple[int, int]] = None) -> Optional[np.ndarray]:
+        """Flattened view of the locked document (with the orientation
+        correction applied), at `size` = (w, h), or `scan_size` by default."""
+        if self._lock is None:
+            return None
+        return warp_document(frame, self._lock.corners[self._perm], size=size or self.scan_size)
 
     # ------------------------------ update -------------------------------- #
-    def update(self, frame: np.ndarray, t: Optional[float] = None) -> List[Track]:
+    def update(self, frame: np.ndarray, t: Optional[float] = None,
+               occluders: Optional[List[np.ndarray]] = None) -> List[Track]:
+        """`occluders`: polygons (N, 2) of things known to be in front of the
+        documents (hands). In browse mode a document under one is treated as
+        covered, not gone: it keeps its position, ID and confidence."""
         t = time.perf_counter() if t is None else t
         self._last_frame, self._last_t = frame, t
         if self._lock is not None:
-            corners = self._lock.update(frame, t, self.detector)
-            self._lock_track.corners = corners.copy()
+            self._lock.update(frame, t, self.detector)
             self._lock_track.state = self._lock.state
-            self._lock_track.visible = self._lock.visible.copy()
+            self._sync_lock_track()
             return [self._lock_track]
-        self._update_browse(frame, self.detector.detect(frame), t)
+        self._update_browse(frame, self.detector.detect(frame), t, occluders or [])
         return self.tracks
 
-    def _update_browse(self, frame: np.ndarray, detections, t: float) -> None:
+    def _update_browse(self, frame: np.ndarray, detections, t: float, occluders) -> None:
         tracks = list(self._tracks.values())
+        covered = {tr.id for tr in tracks if any(_overlaps(tr.corners, o) for o in occluders)}
         pairs = sorted(((quad_iou(tr.corners, d.corners), ti, di)
                         for ti, tr in enumerate(tracks) for di, d in enumerate(detections)),
                        reverse=True)
@@ -137,6 +178,9 @@ class DocumentTracker:
             tr, d = tracks[ti], detections[di]
             new = _align(tr.corners, d.corners)
             diag = float(np.linalg.norm(tr.corners[2] - tr.corners[0])) + 1e-6
+            if tr.id in covered and float(np.linalg.norm(new - tr.corners, axis=1).max()) > 0.03 * diag:
+                tr.misses = 0                 # a hand distorts the outline: keep the old one
+                continue
             if float(np.linalg.norm(new - tr.corners, axis=1).mean()) > 0.25 * diag:
                 tr._filter.reset()
             tr.corners = tr._filter(new, t)
@@ -145,6 +189,9 @@ class DocumentTracker:
             tr.misses = 0
         for ti, tr in enumerate(tracks):
             if ti not in used_t:
+                if tr.id in covered:
+                    tr.misses = 0             # under a hand: covered, not gone
+                    continue
                 tr.misses += 1                # keep last position through short dropouts
                 tr.score *= 0.97
                 if tr.misses > self.max_misses:
@@ -163,6 +210,14 @@ class DocumentTracker:
         top = {tr.id for tr in cands[:self.max_docs]}
         for tr in self._tracks.values():
             tr.shown = tr.id in top
+
+
+def _overlaps(quad: np.ndarray, poly: np.ndarray) -> bool:
+    poly = np.asarray(poly, np.float32).reshape(-1, 2)
+    if len(poly) < 3:
+        return False
+    inter, _ = cv2.intersectConvexConvex(np.asarray(quad, np.float32), poly)
+    return inter > 0
 
 
 def _align(old: np.ndarray, new: np.ndarray) -> np.ndarray:

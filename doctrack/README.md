@@ -16,6 +16,14 @@ uv run python -m pytest -q
 keyboard / the person writing). Corner labels TL/TR/BR/BL and the scan are in the *document's* frame, so the
 scan is upright for the reader. Change with `--doc-up {down,up,left,right}`.
 
+**Selecting with your hand:** point at a document with your index finger for **1 s**. A green ring fills
+around your fingertip, and when it closes the document is locked. This uses MediaPipe and the team's gesture check
+from `../Hand_tracker/hand_realtime.py`: index straight, other fingers curled, thumb away from the index. A hand
+holding a pen doesn't select anything. After a release, take your finger off the page before pointing again.
+Options: `--dwell 1.5`, `--point-dir any` (the default `down` matches Hand_tracker), `--any-finger-pose`,
+`--no-hands` (click only). Hand tracking runs only while browsing. A page under a hand is treated as covered,
+not gone, so it doesn't vanish while you point at it.
+
 **Browse mode:** calm on purpose (a desk is a slow scene). A document is only shown after it has been
 detected confidently for about 1/3 s. At most 3 are shown, and they are smoothed heavily. **Left click** one to lock.
 **Locked mode:** only that document is tracked and it is never dropped. Each corner is handled on its own: a
@@ -23,6 +31,9 @@ corner covered by a hand or pen (hollow circle) keeps its **last position**, and
 This works for 1, 2, 3 or all 4 corners. When uncovered, it is searched for starting at its last position and going
 outward. Outline: green = all corners seen, yellow = some covered, orange = all covered. The scan has a fixed size
 (A4 1:√2 by default). **`r` or right click** releases it.
+**Scan window:** freely resizable. Its size *is* the warp size (what you see is what `s` saves), and it opens
+at the paper shape. Toolbar: **Rotate 90** (`o`) turns the document's orientation clockwise. **Mirror** (`m`)
+flips it left-right. Both relabel the corners, so `tr.selected.corners` stays consistent with the scan.
 Keys: `q`/Esc quit, `d` debug masks, `s` save scan PNG.
 
 ## Library use (for another frontend)
@@ -35,7 +46,8 @@ tr.select(track_id) / tr.select_at(x, y) / tr.clear_selection()
 tr.selected.corners                  # (4, 2) float32, TL TR BR BL
 tr.selected.state                    # "tracking" | "partial" | "searching"
 tr.selected.visible                  # per-corner bool: False = covered, last position kept
-tr.scan(frame)                       # flattened doc, always tr.scan_size
+tr.scan(frame, size=(w, h))          # flattened doc (default size: tr.scan_size)
+tr.rotate() / tr.toggle_mirror()     # fix the document orientation
 tr.selected.to_dict()                # JSON-ready
 ```
 
@@ -45,6 +57,7 @@ tr.selected.to_dict()                # JSON-ready
   interior dominated by one colour (the paper, whatever it is) × not-too-busy texture × paper-like aspect
   (squares penalised). Text blocks nested inside a page are merged into it, then NMS, then corners are
   snapped to the real edges at full resolution (`geometry.refine_quad`, sub-pixel line fits).
+- `hands.py`: MediaPipe hand landmarks + `DwellSelector` (fingertip-on-document timer).
 - `tracker.py`, browse mode: IoU matching for stable IDs, heavy One-Euro smoothing (`filters.py`),
   confidence + age gating, at most `max_docs` shown (with hysteresis so the set doesn't flicker).
 - `locked.py` + `corners.py`, locked mode: each corner is located locally by fitting the two page sides that meet
