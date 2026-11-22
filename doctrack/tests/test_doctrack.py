@@ -100,7 +100,7 @@ def _track_scene(frame_fn, n, tracker, t0=0.0):
 
 
 def test_browse_then_lock_ignores_others():
-    tr = DocumentTracker(OpenCVDocumentDetector())
+    tr = DocumentTracker(OpenCVDocumentDetector(), lock_backend="classic")
     img = _scene([Q1, Q2])
     _track_scene(lambda i: img, 5, tr)
     assert tr.tracks == []                           # not shown until confident for a while
@@ -123,7 +123,7 @@ def test_browse_shows_at_most_three():
                                      [[360, 60], [600, 60], [600, 400], [360, 400]],
                                      [[660, 60], [900, 60], [900, 400], [660, 400]],
                                      [[960, 60], [1200, 60], [1200, 400], [960, 400]])]
-    tr = DocumentTracker(OpenCVDocumentDetector())
+    tr = DocumentTracker(OpenCVDocumentDetector(), lock_backend="classic")
     img = _scene(quads)
     _track_scene(lambda i: img, 15, tr)
     shown = [t.id for t in tr.tracks]
@@ -142,7 +142,7 @@ def test_scan_is_upright_for_reader():
 
 
 def _locked_tracker(q1, q2, size=(1920, 1080)):
-    tr = DocumentTracker(OpenCVDocumentDetector())
+    tr = DocumentTracker(OpenCVDocumentDetector(), lock_backend="classic")
     img = _scene([q1, q2], size=size)
     _track_scene(lambda i: img, 12, tr)
     c = np.float32(q1).mean(0)
@@ -260,7 +260,7 @@ def _hand(tip, pointing=True):
 
 
 def _browse_ready():
-    tr = DocumentTracker(OpenCVDocumentDetector())
+    tr = DocumentTracker(OpenCVDocumentDetector(), lock_backend="classic")
     img = _scene([Q1, Q2])
     _track_scene(lambda i: img, 15, tr)
     assert len(tr.tracks) == 2
