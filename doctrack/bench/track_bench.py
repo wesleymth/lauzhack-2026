@@ -11,7 +11,8 @@ measures how far the tracked corners are from the true ones.
     uv run python -m bench.track_bench --save out/           # also write videos
 
 Scenarios: still (jitter), slide (move + rotate), corner (hand over a corner,
-page still), drag (hand on the page while it slides).
+page still), drag (hand on the page while it slides), away (page taken away for
+20 frames and put back 200 px further; error measured while it is in view).
 Metrics, after the lock: mean / max corner error (px), share of frames whose
 error is above 15 px ("off"), mean step-to-step wobble on still frames (px),
 and ms per frame of the tracker alone.
@@ -111,6 +112,11 @@ def scenario(name, n=120):
             q = quad_at(*c0, 8)
             on = 0.2 < f < 0.8
             yield q, (hand_poly(q[2] + np.float32([-20, -30]), 30) if on else None)
+        elif name == "away":                                # page taken away, put back elsewhere
+            if 0.3 < f < 0.47:
+                yield None, None
+            else:
+                yield (quad_at(*c0, 8) if f <= 0.3 else quad_at(c0[0] + 200, c0[1] + 30, -4)), None
         elif name == "drag":
             g = np.clip((f - 0.15) / 0.7, 0, 1)
             q = quad_at(c0[0] + 220 * g, c0[1] - 40 * g, 8 - 10 * g)
@@ -139,6 +145,12 @@ def run(backend, name, tex, bg, save=None):
     writer = None
     for i, (q, hand) in enumerate(frames):
         gain = 1.0 + 0.04 * np.sin(i / 9.0)                 # slight exposure flicker
+        if q is None:                                       # page not in view: only the desk
+            img = np.clip(bg.astype(np.float32) * gain + rng.normal(0, 3.0, bg.shape), 0, 255).astype(np.uint8)
+            tr.update(img, t)
+            t += 1 / 30
+            prev = None
+            continue
         img = render(bg, tex, q, hand, rng, gain)
         t0 = time.perf_counter()
         tr.update(img, t, occluders=[] if hand is None else [hand])
@@ -146,7 +158,7 @@ def run(backend, name, tex, bg, save=None):
         t += 1 / 30
         est = tr.selected.corners
         errs.append(corner_error(est, q))
-        if prev is not None and np.abs(frames[i - 1][0] - q).max() < 1e-3:
+        if prev is not None and frames[i - 1][0] is not None and np.abs(frames[i - 1][0] - q).max() < 1e-3:
             still_steps.append(float(np.linalg.norm(est - prev, axis=1).mean()))
         prev = est.copy()
         if save:
@@ -184,13 +196,13 @@ def backends():
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", action="append", help="lock backend(s) to test (default: all found)")
-    ap.add_argument("--scenario", action="append", choices=["still", "slide", "corner", "drag"])
+    ap.add_argument("--scenario", action="append", choices=["still", "slide", "corner", "drag", "away"])
     ap.add_argument("--save", help="folder for videos (green = truth, red = tracked)")
     args = ap.parse_args()
     tex, bg = page_texture(), desk()
     print(f"{'backend':<12}{'scenario':<9}{'mean px':>9}{'max px':>9}{'off %':>8}{'wobble':>9}{'ms':>7}")
     for b in args.backend or backends():
-        for s in args.scenario or ["still", "slide", "corner", "drag"]:
+        for s in args.scenario or ["still", "slide", "corner", "drag", "away"]:
             r = run(b, s, tex, bg, args.save)
             if r is None:
                 print(f"{b:<12}{s:<9}  could not lock the page")
