@@ -13,7 +13,11 @@ Keys (any window): Esc/q quit, r release, o rotate, m mirror, s save scan PNG, d
 
 Remote control (e.g. the Logitech plugin), POST on http://127.0.0.1:8765/
     rotate, mirror, release, save, quit, format/<auto|a4p|a4l|photo>
-    
+    audio/on, audio/off       start / stop the voice-note recording
+    face                      show / hide the recognised face thumbnail
+    share/pdf                 export the scan as a PDF (no notes)
+    share/pdf-notes           export the scan as a PDF with the voice notes
+
 Voice notes (locked document): v starts/stops recording. Each spoken sentence
 becomes a note pinned where your RIGHT index finger points (pointing pose) on
 the page when the sentence begins. p exports the scan as a PDF with one
@@ -41,7 +45,8 @@ STATE_COLORS = {"tracking": (0, 255, 0), "partial": (0, 220, 255), "covered": (0
 SDK_DIR = Path(__file__).resolve().parents[2] / "logiinsight_api"
 
 FORMATS = ("auto", "a4p", "a4l", "photo")
-REMOTE_COMMANDS = ("rotate", "mirror", "release", "save", "quit")
+REMOTE_COMMANDS = ("rotate", "mirror", "release", "save", "quit",
+                   "face", "audio/on", "audio/off", "share/pdf", "share/pdf-notes")
 
 
 def open_source(args):
@@ -183,12 +188,13 @@ class ExportProgress:
         return label + " ...", base + weight * in_stage, detail
 
 
-def to_downloads(pdf: Path, folder: Path) -> Path:
+def to_downloads(pdf: Path, folder: Path, stem: str = None) -> Path:
     """Copy the exported PDF into the Downloads folder like a browser download:
     `name.pdf`, or `name (1).pdf`, `name (2).pdf` ... if it already exists."""
     import shutil
     folder.mkdir(parents=True, exist_ok=True)
-    stem = "voice-notes_" + pdf.parent.name + "_" + pdf.stem.replace("notes_", "")
+    if stem is None:
+        stem = "voice-notes_" + pdf.parent.name + "_" + pdf.stem.replace("notes_", "")
     dest, i = folder / f"{stem}.pdf", 1
     while dest.exists():
         dest, i = folder / f"{stem} ({i}).pdf", i + 1
@@ -203,7 +209,7 @@ def placeholder(w, h, text="point at / click a document"):
 
 
 def start_control_server(cmds, port=8765):
-    """Tiny local server: POST /rotate, /mirror, /release, /save, /quit, /format/<name>
+    """Tiny local server: POST /<command> (see REMOTE_COMMANDS) or /format/<name>
     -> queued for the main loop (all UI work stays on the main thread)."""
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -269,7 +275,8 @@ def main(argv=None):
     ap.add_argument("--download-dir", default="~/Downloads",
                     help="the exported PDF is also copied here ('' = don't)")
     ap.add_argument("--faces", action="store_true",
-                    help="recognise enrolled faces (f = enroll the face in view)")
+                    help="recognise enrolled faces (f = enroll the face in view); "
+                         "the plugin's Face button can also switch it on later")
     args = ap.parse_args(argv)
 
     cap = open_source(args)
@@ -287,7 +294,7 @@ def main(argv=None):
             print(f"hand tracking unavailable ({e}); click to select")
 
     voice = None
-    
+
     face_rec = None
     if args.faces:
         try:
@@ -296,7 +303,8 @@ def main(argv=None):
             print(f"faces on: {len(face_rec.db)} enrolled, f = enroll")
         except Exception as e:  # model download failed / old OpenCV: keep running without
             print(f"faces unavailable ({e})")
-            
+    state["faces_on"] = face_rec is not None      # the Face button switches this on / off
+
     if not args.no_voice:
         from .voice import VoiceNotes
         voice = VoiceNotes(Path(args.notes_dir), mic=args.mic, camera_mic=args.camera_mic,
@@ -359,12 +367,41 @@ def main(argv=None):
         except Exception as e:  # no mic / no access: keep the app running
             print(f"voice: cannot record ({e})")
 
-    def export():
-        if voice is None:
+    def audio_on():
+        """Plugin button: start recording (no-op if already recording)."""
+        if voice is not None and not voice.recording:
+            toggle_voice()                       # refuses if no document is locked
+
+    def audio_off():
+        """Plugin button: stop recording (no-op if not recording)."""
+        if voice is not None and voice.recording:
+            toggle_voice()
+
+    def toggle_faces():
+        """Plugin button: show / hide the recognised face thumbnail."""
+        nonlocal face_rec
+        if face_rec is None:                     # launched without --faces: load it now
+            try:
+                from .faces import FaceRecognizer
+                face_rec = FaceRecognizer()
+                print(f"faces on: {len(face_rec.db)} enrolled, f = enroll")
+            except Exception as e:
+                print(f"faces unavailable ({e})")
+                return
+            state["faces_on"] = True
             return
+        state["faces_on"] = not state["faces_on"]
+        print("faces on" if state["faces_on"] else "faces off")
+
+    def export(with_notes=True):
+        """Export the locked scan as a PDF and copy it to the download folder.
+        with_notes=True: pinned voice notes (+ summary); False: the plain scan only."""
         frame = state.get("frame")
         if not tracker.locked or frame is None:
             print("export: lock a document first")
+            return
+        if with_notes and voice is None:
+            print("export: voice notes are disabled (--no-voice)")
             return
         running = state.get("export")
         if running is not None and not (running.done or running.error):
@@ -372,12 +409,19 @@ def main(argv=None):
             return
         scan = tracker.scan(frame)                     # full paper-size scan, current orientation
         view = tracker.view_transform()
-        voice.stop()
-        if not voice.recordings:
-            print("export: no voice notes yet (v to record)")
-        out_dir = voice.session_dir or Path(args.notes_dir)
+        stamp = time.strftime("%H-%M-%S")
+        if with_notes:
+            voice.stop()
+            if not voice.recordings:
+                print("export: no voice notes yet (v to record)")
+            out_dir = voice.session_dir or Path(args.notes_dir)
+            path = out_dir / f"notes_{stamp}.pdf"
+            download_stem = None
+        else:
+            out_dir = Path(args.notes_dir) / "scans"
+            path = out_dir / f"scan_{stamp}.pdf"
+            download_stem = f"scan_{time.strftime('%Y%m%d_%H%M%S')}"
         out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"notes_{time.strftime('%H-%M-%S')}.pdf"
 
         progress = ExportProgress(path)
         state["export"] = progress
@@ -385,28 +429,31 @@ def main(argv=None):
         def run():
             from .voice import export_pdf
             try:
-                if voice.busy:
-                    progress.stage("wait")
-                    print("export: waiting for transcription to finish ...", flush=True)
-                voice.wait()
-                notes = voice.notes()
-                summary = None
-                if args.llm_model:
-                    try:
-                        from .refine import refine_notes
-                        summary, notes = refine_notes(scan, notes, view, model=args.llm_model,
-                                                      url=args.ollama_url, log_path=path.with_suffix(".llm.json"),
-                                                      on_stage=progress.stage)
-                    except Exception as e:  # OCR failed...: plain notes
-                        print(f"refine: skipped ({type(e).__name__}: {e}); exporting the notes as spoken",
-                              flush=True)
+                notes, summary = [], None
+                if with_notes:
+                    if voice.busy:
+                        progress.stage("wait")
+                        print("export: waiting for transcription to finish ...", flush=True)
+                    voice.wait()
+                    notes = voice.notes()
+                    if args.llm_model:
+                        try:
+                            from .refine import refine_notes
+                            summary, notes = refine_notes(scan, notes, view, model=args.llm_model,
+                                                          url=args.ollama_url,
+                                                          log_path=path.with_suffix(".llm.json"),
+                                                          on_stage=progress.stage)
+                        except Exception as e:  # OCR failed...: plain notes
+                            print(f"refine: skipped ({type(e).__name__}: {e}); exporting the notes as spoken",
+                                  flush=True)
                 progress.stage("pdf")
                 export_pdf(scan, notes, path, view=view, paper=args.paper, summary=summary)
                 placed = sum(n.uv is not None for n in notes)
                 print(f"exported {path} ({len(notes)} notes, {placed} pinned)", flush=True)
                 if args.download_dir:
                     try:
-                        progress.download = to_downloads(path, Path(args.download_dir).expanduser())
+                        progress.download = to_downloads(path, Path(args.download_dir).expanduser(),
+                                                         stem=download_stem)
                         print(f"saved to {progress.download}", flush=True)
                     except OSError as e:
                         print(f"could not copy the PDF to {args.download_dir}: {e}", flush=True)
@@ -416,6 +463,12 @@ def main(argv=None):
                 progress.error = f"{type(e).__name__}: {e}"
                 print(f"export failed: {progress.error}", flush=True)
         threading.Thread(target=run, daemon=True).start()
+
+    def share_pdf():
+        export(with_notes=False)
+
+    def share_pdf_notes():
+        export(with_notes=True)
 
     def toggle_debug():
         state["debug"] = not state["debug"]
@@ -435,8 +488,12 @@ def main(argv=None):
             return
         print(f"enrolled {name}" if face_rec.enroll(name.strip(), frame) else "enroll: no face seen")
 
+    # keys / buttons in the windows use these names; the plugin routes are mapped to them
+    # in run_remote_commands ("audio/on" -> audio_on, "share/pdf-notes" -> share_pdf_notes)
     actions = dict(click=click, release=release, rotate=rotate, mirror=mirror, save=save,
                    debug=toggle_debug, voice=toggle_voice, export=export, enroll=enroll,
+                   audio_on=audio_on, audio_off=audio_off, face=toggle_faces,
+                   share_pdf=share_pdf, share_pdf_notes=share_pdf_notes,
                    quit=lambda: state.update(quit=True))
     ui = UI(actions)
     cmds = queue.Queue()
@@ -451,10 +508,11 @@ def main(argv=None):
                 name = cmds.get_nowait()
             except queue.Empty:
                 return
+            key = name.replace("/", "_").replace("-", "_")
             if name.startswith("format/"):
                 set_format(name.split("/", 1)[1])
-            elif name in actions:
-                actions[name]()
+            elif key in actions:
+                actions[key]()
             else:
                 print(f"remote command not implemented: {name}")
             # let Tk apply the new window size before the next command reads it
@@ -504,7 +562,7 @@ def main(argv=None):
                 draw_hands(vis, hands, hand_tracker.connections, selector, now,
                            pointer_hand=pointer_hand, labels=tracker.locked)
             faces = []
-            if face_rec is not None:
+            if face_rec is not None and state["faces_on"]:
                 from .faces import draw as draw_faces
                 faces = face_rec.identify(frame)
                 draw_faces(vis, faces)
@@ -523,7 +581,7 @@ def main(argv=None):
             state["scan"] = scan
             if scan is not None and voice is not None:
                 scan = draw_notes(scan, voice.notes(), tracker.view_transform(), pointer_uv, voice.recording)
-            if scan is not None and face_rec is not None:
+            if scan is not None and face_rec is not None and state["faces_on"]:
                 from .faces import draw_thumbs
                 scan = scan.copy()                 # keep state["scan"] clean: the s key saves it
                 draw_thumbs(scan, frame, faces, size=0.2)
