@@ -22,6 +22,44 @@ namespace Loupedeck.ExamplePlugin
                 }
             });
         }
+
+        // True if something listens on the app's control port (the app is already up).
+        public static Boolean IsRunning()
+        {
+            try
+            {
+                using (var tcp = new System.Net.Sockets.TcpClient())
+                {
+                    return tcp.ConnectAsync("127.0.0.1", 8765).Wait(300) && tcp.Connected;
+                }
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        // doctrack/start.command: $DOCTRACK_DIR if set, else found by walking up from the plugin
+        // DLL (the dev build is linked from <repo>/ExamplePlugin/bin, so the repo is above it).
+        public static String FindStartScript()
+        {
+            var env = Environment.GetEnvironmentVariable("DOCTRACK_DIR");
+            if (!String.IsNullOrEmpty(env) && System.IO.File.Exists(System.IO.Path.Combine(env, "start.command")))
+            {
+                return System.IO.Path.Combine(env, "start.command");
+            }
+            var dir = System.IO.Path.GetDirectoryName(typeof(DocTrackClient).Assembly.Location);
+            while (!String.IsNullOrEmpty(dir))
+            {
+                var candidate = System.IO.Path.Combine(dir, "doctrack", "start.command");
+                if (System.IO.File.Exists(candidate))
+                {
+                    return candidate;
+                }
+                dir = System.IO.Path.GetDirectoryName(dir);
+            }
+            return null;
+        }
     }
 
     internal static class Icons
@@ -246,6 +284,48 @@ namespace Loupedeck.ExamplePlugin
 
         protected override BitmapImage GetCommandImage(String actionParameter, PluginImageSize imageSize)
             => Icons.Get(this._on ? "mic_on" : "mic_off", imageSize);
+    }
+
+    // Start: launches the Python app (doctrack/start.command) in a Terminal window.
+    // Terminal already has camera + microphone access and keeps the log visible; the plugin
+    // service itself would have neither uv on its PATH nor those permissions.
+    public class StartCommand : PluginDynamicCommand
+    {
+        public StartCommand()
+            : base(displayName: "Start", description: "Start DocTrack", groupName: "DocTrack")
+        {
+        }
+
+        protected override void RunCommand(String actionParameter)
+        {
+            if (DocTrackClient.IsRunning())
+            {
+                PluginLog.Info("DocTrack is already running");
+                return;
+            }
+            var script = DocTrackClient.FindStartScript();
+            if (script == null)
+            {
+                PluginLog.Error("doctrack/start.command not found above the plugin folder; set DOCTRACK_DIR");
+                return;
+            }
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("open") { UseShellExecute = false };
+                psi.ArgumentList.Add("-a");
+                psi.ArgumentList.Add("Terminal");
+                psi.ArgumentList.Add(script);
+                System.Diagnostics.Process.Start(psi);
+                PluginLog.Info($"Starting DocTrack: {script}");
+            }
+            catch (Exception ex)
+            {
+                PluginLog.Error(ex, "Could not start DocTrack");
+            }
+        }
+
+        protected override BitmapImage GetCommandImage(String actionParameter, PluginImageSize imageSize)
+            => Icons.Get("start", imageSize);
     }
 
     // Stop: asks the running Python app to quit (it closes the windows and releases the camera).
