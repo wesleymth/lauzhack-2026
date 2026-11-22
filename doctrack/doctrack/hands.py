@@ -29,6 +29,8 @@ class Hand:
     handedness: str
     pointing: bool
     reason: str = ""
+    pointing_any_dir: bool = False     # pointing pose, whatever the direction (voice notes)
+    reason_any_dir: str = ""
 
     @property
     def tip(self) -> np.ndarray:
@@ -69,6 +71,7 @@ class HandTracker:
         self.width = width
         self._gesture = SimpleNamespace(point_dir=point_dir, dir_tolerance=dir_tolerance,
                                         straight_deg=straight_deg, pinch_ratio=pinch_ratio)
+        self._gesture_any = SimpleNamespace(**{**vars(self._gesture), "point_dir": "any"})
         # MediaPipe labels assume a mirrored selfie image; this desk camera is not mirrored,
         # so Left/Right are swapped by default (as in Hand_tracker, unless --keep-labels).
         self.swap_labels = swap_labels
@@ -93,7 +96,8 @@ class HandTracker:
             label = hd[0].category_name
             if self.swap_labels:
                 label = {"Left": "Right", "Right": "Left"}.get(label, label)
-            hands.append(Hand(pts, label, bool(pointing), reason))
+            any_dir, reason_any = self._hr.pointing_check(lm, w, h, self._gesture_any)
+            hands.append(Hand(pts, label, bool(pointing), reason, bool(any_dir), reason_any))
         return hands
 
     def close(self) -> None:

@@ -117,3 +117,51 @@ def test_recording_pipeline_with_fake_mic_and_model(tmp_path, monkeypatch):
     assert [n.uv for n in notes] == [(0.1, 0.2), (0.7, 0.8)]
     assert (vn.session_dir / "rec_01" / "session.wav").stat().st_size > 2 * sr
     assert isinstance(vn.recordings[0], Recording)
+
+
+def fake_hand(label, tip, pointing=True, reason="index not extended"):
+    return SimpleNamespace(handedness=label, tip=np.asarray(tip, float), pointing_any_dir=pointing,
+                           reason_any_dir="ok" if pointing else reason)
+
+
+def test_pick_pointer_label_is_only_a_priority_and_direction_is_ignored():
+    from doctrack.voice import pick_pointer
+    to_doc = lambda x, y: (x / 100, y / 100) if 0 <= x <= 100 and 0 <= y <= 100 else None
+    assert pick_pointer([], to_doc)[2] == "no hand seen"
+    # right hand mislabelled "Left" by MediaPipe: still used
+    uv, h, st = pick_pointer([fake_hand("Left", (50, 20))], to_doc, "Right")
+    assert (uv, st) == ((0.5, 0.2), "ok")
+    # both pointing on the page: the labelled hand wins
+    uv, h, _ = pick_pointer([fake_hand("Left", (10, 10)), fake_hand("Right", (90, 90))], to_doc, "Right")
+    assert h.handedness == "Right" and uv == (0.9, 0.9)
+    # reasons
+    assert pick_pointer([fake_hand("Right", (500, 5))], to_doc)[2] == "fingertip off the page"
+    assert pick_pointer([fake_hand("Right", (5, 5), pointing=False)], to_doc)[2] == "index not extended"
+    assert pick_pointer([fake_hand("Right", (5, 5), pointing=False)], to_doc, any_pose=True)[2] == "ok"
+
+
+def notes_from(sentences, samples):
+    vn = VoiceNotes("/nonexistent")
+    vn.recordings = [SimpleNamespace(sentences=lambda: sentences)]
+    for t, uv in samples:
+        vn.pointer.add(t, *uv)
+    return vn.notes()
+
+
+def test_sentence_without_finger_joins_the_last_comment():
+    notes = notes_from([(10, 12, "Look here."), (13, 15, "Still about it."), (20, 22, "New point.")],
+                       [(10.0, (0.2, 0.2)), (20.1, (0.8, 0.8))])
+    assert [(n.text, n.uv) for n in notes] == [("Look here. Still about it.", (0.2, 0.2)),
+                                             ("New point.", (0.8, 0.8))]
+    assert notes[0].end == 15
+
+
+def test_finger_lifted_before_talking_starts_a_comment_at_its_last_spot():
+    # pointed at (0.7, 0.3) at t=16, lifted, then spoke at t=20 with no finger on the page
+    notes = notes_from([(10, 12, "First."), (20, 22, "Second.")], [(10.0, (0.1, 0.1)), (16.0, (0.7, 0.3))])
+    assert [(n.text, n.uv) for n in notes] == [("First.", (0.1, 0.1)), ("Second.", (0.7, 0.3))]
+
+
+def test_no_finger_at_all_gives_one_unpinned_comment():
+    notes = notes_from([(1, 2, "A."), (3, 4, "B.")], [])
+    assert [(n.text, n.uv) for n in notes] == [("A. B.", None)]

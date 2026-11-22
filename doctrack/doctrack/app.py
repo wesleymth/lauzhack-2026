@@ -32,7 +32,7 @@ from .tracker import DocumentTracker
 
 CORNER_COLORS = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)]  # doc TL TR BR BL (BGR)
 CORNER_NAMES = ["TL", "TR", "BR", "BL"]
-STATE_COLORS = {"tracking": (0, 255, 0), "partial": (0, 220, 255), "searching": (0, 120, 255)}
+STATE_COLORS = {"tracking": (0, 255, 0), "partial": (0, 220, 255), "covered": (0, 220, 255), "searching": (0, 120, 255)}
 SDK_DIR = Path(__file__).resolve().parents[2] / "logiinsight_api"
 
 
@@ -88,13 +88,22 @@ def draw(frame, tracker, fps, extra=""):
     return out
 
 
-def draw_hands(out, hands, connections, selector, t):
+def draw_hands(out, hands, connections, selector, t, pointer_hand=None, labels=False):
     for h in hands:
         pts = [tuple(int(v) for v in p) for p in h.landmarks]
-        color = (0, 255, 0) if h.pointing else (180, 180, 180)
+        if labels:   # locked (voice notes): green = this fingertip places the notes
+            used = h is pointer_hand
+            color = (0, 255, 0) if used else (180, 180, 180)
+        else:
+            color = (0, 255, 0) if h.pointing else (180, 180, 180)
         for a, b in connections:
             cv2.line(out, pts[a], pts[b], color, 2, cv2.LINE_AA)
         cv2.circle(out, pts[8], 7, color, -1, cv2.LINE_AA)
+        if labels:
+            text = h.handedness + ": " + ("pointing" if h.pointing_any_dir else h.reason_any_dir)
+            org = (pts[0][0] - 60, pts[0][1] + 30)
+            cv2.putText(out, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(out, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
     if selector is not None and selector.tip is not None:
         # progress ring around the fingertip: full circle = selected
         c = tuple(int(v) for v in selector.tip)
@@ -126,6 +135,57 @@ def draw_notes(scan, notes, view, pointer_uv, recording):
         cv2.circle(out, (22, 22), 9, (0, 0, 255), -1, cv2.LINE_AA)
         cv2.putText(out, "REC", (38, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
     return out
+
+
+class ExportProgress:
+    """Export state shared between the export thread (calls `stage`) and the UI (`status`).
+
+    Each stage has a weight in the bar and a typical duration: within a stage the bar
+    advances with elapsed time up to 95% of the stage, so it keeps moving on slow steps.
+    Skipped stages (no recording to wait for, no LLM) make the bar jump forward."""
+
+    STAGES = [  # name, label, weight, typical seconds
+        ("wait", "Transcribing the last words", 0.30, 12.0),
+        ("ocr", "Reading the page (OCR)", 0.35, 10.0),
+        ("summary", "Writing the summary", 0.30, 8.0),
+        ("pdf", "Writing the PDF", 0.05, 1.0),
+    ]
+
+    def __init__(self, path: Path) -> None:
+        self.path, self.download = path, None
+        self.t0 = time.time()
+        self.current, self.t_stage = None, self.t0
+        self.done, self.error = False, None
+        self.notes, self.summary = 0, False
+
+    def stage(self, name: str) -> None:
+        self.current, self.t_stage = name, time.time()
+
+    def status(self):
+        """(label, fraction 0..1, detail) for the popup."""
+        names = [s[0] for s in self.STAGES]
+        if self.current not in names:
+            return "Starting ...", 0.0, ""
+        i = names.index(self.current)
+        _, label, weight, typical = self.STAGES[i]
+        base = sum(s[2] for s in self.STAGES[:i])
+        in_stage = min(0.95, (time.time() - self.t_stage) / typical)
+        detail = (f"step {i + 1} of {len(self.STAGES)} - {time.time() - self.t_stage:.0f} s"
+                  f" (total {time.time() - self.t0:.0f} s)")
+        return label + " ...", base + weight * in_stage, detail
+
+
+def to_downloads(pdf: Path, folder: Path) -> Path:
+    """Copy the exported PDF into the Downloads folder like a browser download:
+    `name.pdf`, or `name (1).pdf`, `name (2).pdf` ... if it already exists."""
+    import shutil
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = "voice-notes_" + pdf.parent.name + "_" + pdf.stem.replace("notes_", "")
+    dest, i = folder / f"{stem}.pdf", 1
+    while dest.exists():
+        dest, i = folder / f"{stem} ({i}).pdf", i + 1
+    shutil.copyfile(pdf, dest)
+    return dest
 
 
 def placeholder(w, h, text="point at / click a document"):
@@ -160,15 +220,24 @@ def main(argv=None):
     ap.add_argument("--camera-mic", action="store_true", help="use the LogiInsight camera microphone")
     ap.add_argument("--voice-chunk", type=float, default=10.0,
                     help="seconds of audio per transcription chunk (smaller = notes appear sooner)")
-    ap.add_argument("--note-hand", choices=["Right", "Left"], default="Right",
-                    help="hand whose pointing index finger places the voice notes")
+    ap.add_argument("--note-hand", choices=["Right", "Left", "any"], default="Right",
+                    help="hand tried first to place the voice notes (MediaPipe's label; the other "
+                         "hand is used if this one isn't pointing at the page)")
+    ap.add_argument("--note-any-pose", action="store_true",
+                    help="any index fingertip on the page places notes, not only the pointing pose")
     ap.add_argument("--keep-hand-labels", action="store_true",
                     help="do NOT swap MediaPipe's Left/Right (as Hand_tracker --keep-labels)")
     ap.add_argument("--notes-dir", default="voice_notes", help="where recordings and PDFs go")
-    
+    ap.add_argument("--llm-model", default="qwen3:0.6b",
+                    help="Ollama model for the summary. At export the page is OCR'd, note parts that "
+                         "repeat it are removed, and this model writes a summary ('' = notes as spoken)")
+    ap.add_argument("--no-llm", dest="llm_model", action="store_const", const="",
+                    help="same as --llm-model ''")
+    ap.add_argument("--ollama-url", default="http://localhost:11434")
+    ap.add_argument("--download-dir", default="~/Downloads",
+                    help="the exported PDF is also copied here ('' = don't)")
     ap.add_argument("--faces", action="store_true",
                     help="recognise enrolled faces (f = enroll the face in view)")
-    
     args = ap.parse_args(argv)
 
     cap = open_source(args)
@@ -259,6 +328,10 @@ def main(argv=None):
         if not tracker.locked or frame is None:
             print("export: lock a document first")
             return
+        running = state.get("export")
+        if running is not None and not (running.done or running.error):
+            print("export: already running")
+            return
         scan = tracker.scan(frame)                     # full paper-size scan, current orientation
         view = tracker.view_transform()
         voice.stop()
@@ -268,15 +341,42 @@ def main(argv=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"notes_{time.strftime('%H-%M-%S')}.pdf"
 
+        progress = ExportProgress(path)
+        state["export"] = progress
+
         def run():
             from .voice import export_pdf
-            if voice.busy:
-                print("export: waiting for transcription to finish ...", flush=True)
-            voice.wait()
-            notes = voice.notes()
-            export_pdf(scan, notes, path, view=view, paper=args.paper)
-            placed = sum(n.uv is not None for n in notes)
-            print(f"exported {path} ({len(notes)} notes, {placed} pinned)", flush=True)
+            try:
+                if voice.busy:
+                    progress.stage("wait")
+                    print("export: waiting for transcription to finish ...", flush=True)
+                voice.wait()
+                notes = voice.notes()
+                summary = None
+                if args.llm_model:
+                    try:
+                        from .refine import refine_notes
+                        summary, notes = refine_notes(scan, notes, view, model=args.llm_model,
+                                                      url=args.ollama_url, log_path=path.with_suffix(".llm.json"),
+                                                      on_stage=progress.stage)
+                    except Exception as e:  # OCR failed...: plain notes
+                        print(f"refine: skipped ({type(e).__name__}: {e}); exporting the notes as spoken",
+                              flush=True)
+                progress.stage("pdf")
+                export_pdf(scan, notes, path, view=view, paper=args.paper, summary=summary)
+                placed = sum(n.uv is not None for n in notes)
+                print(f"exported {path} ({len(notes)} notes, {placed} pinned)", flush=True)
+                if args.download_dir:
+                    try:
+                        progress.download = to_downloads(path, Path(args.download_dir).expanduser())
+                        print(f"saved to {progress.download}", flush=True)
+                    except OSError as e:
+                        print(f"could not copy the PDF to {args.download_dir}: {e}", flush=True)
+                progress.notes, progress.summary = len(notes), bool(summary)
+                progress.done = True
+            except Exception as e:  # shown in the popup instead of dying silently in the thread
+                progress.error = f"{type(e).__name__}: {e}"
+                print(f"export failed: {progress.error}", flush=True)
         threading.Thread(target=run, daemon=True).start()
 
     def toggle_debug():
@@ -316,8 +416,8 @@ def main(argv=None):
             now = time.perf_counter()
             state["frame"] = frame
             hands = []
-            # hands are needed to select (browse) and, with voice notes, to point while locked
-            if hand_tracker is not None and (not tracker.locked or voice is not None):
+            # select by pointing; "covered" while locked; voice notes: the pointing fingertip
+            if hand_tracker is not None:
                 hands = hand_tracker.detect(frame, now)
             tracker.update(frame, now, occluders=[h.hull for h in hands])
             if selector is not None:
@@ -329,22 +429,22 @@ def main(argv=None):
 
             if tracker.locked and not was_locked and voice is not None:
                 voice.reset()                      # new document: new set of notes
-            pointer_uv = None
+            pointer_uv, pointer_hand, pointer_status = None, None, ""
             if voice is not None and tracker.locked:
-                for h in hands:
-                    if h.handedness == args.note_hand and h.pointing:
-                        pointer_uv = tracker.to_doc(*h.tip)
-                        if pointer_uv is not None:
-                            voice.add_pointer(time.time(), pointer_uv)
-                            break
+                from .voice import pick_pointer
+                pointer_uv, pointer_hand, pointer_status = pick_pointer(
+                    hands, tracker.to_doc, args.note_hand, args.note_any_pose)
+                voice.add_pointer(time.time(), pointer_uv, pointer_status)
 
             extra = ""
             if voice is not None and tracker.locked:
                 n = len(voice.notes())
                 extra = (" | REC (v stop)" if voice.recording else " | v record") + f" | {n} note(s), p export"
+                extra += " | finger: " + ("on page" if pointer_uv is not None else pointer_status)
             vis = draw(frame, tracker, fps, extra)
             if hands:
-                draw_hands(vis, hands, hand_tracker.connections, selector, now)
+                draw_hands(vis, hands, hand_tracker.connections, selector, now,
+                           pointer_hand=pointer_hand, labels=tracker.locked)
             faces = []
             if face_rec is not None:
                 from .faces import draw as draw_faces
@@ -374,6 +474,7 @@ def main(argv=None):
 
             if state["debug"] and tracker.detector.debug:
                 ui.show_debug(np.hstack(list(tracker.detector.debug.values())))
+            ui.show_export(state.get("export"))   # progress popup (Tk: main thread only)
             ui.update()                            # handles clicks, buttons and keys
     except KeyboardInterrupt:
         pass
