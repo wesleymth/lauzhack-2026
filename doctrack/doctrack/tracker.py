@@ -56,13 +56,15 @@ class DocumentTracker:
                  max_docs: int = 3, min_hits: int = 10, min_score: float = 0.6,
                  new_score: float = 0.45, match_iou: float = 0.3, max_misses: int = 30,
                  lock_backend: str = "auto") -> None:
-        """lock_backend: how a selected document is tracked. "docaligner" =
+        """lock_backend: how a selected document is tracked. "flow" = follows the
+        page's content (optical flow + homography, ORB re-matching; flow_track.py),
+        handing blank pages over to docaligner; "docaligner" =
         pretrained DocAligner corner model (onnxruntime), "vision" = Apple's
         document detector (macOS), "classic" = the OpenCV tracker, "auto" =
-        docaligner when onnxruntime is available."""
+        flow (this branch's default)."""
         self.detector = detector
         if lock_backend == "auto":
-            lock_backend = "docaligner" if docaligner_available() else "classic"
+            lock_backend = "flow"
         self.lock_backend = lock_backend
         self._last_occluders: List[np.ndarray] = []
         self._model = None                                # corner model, loaded on first lock
@@ -178,7 +180,22 @@ class DocumentTracker:
         t = self._tracks.get(track_id)
         if t is None or self._last_frame is None:
             return False
-        if self.lock_backend in ("vision", "docaligner"):
+        if self.lock_backend == "flow":
+            from .flow_track import FlowLockedTracker
+            frame, corners, t0, occ = self._last_frame, t.corners, self._last_t, self._last_occluders
+
+            def fallback():                      # blank page: the DocAligner tracker takes over
+                if not docaligner_available():
+                    return LockedTracker(frame, corners, t0, paper="auto", scan_long_side=self.scan_long_side)
+                if self._model is None:
+                    self._model = DocAlignerModel()
+                return VisionLockedTracker(frame, corners, t0, paper="auto", scan_long_side=self.scan_long_side,
+                                           occluders=occ, detector=self._model)
+            self._lock = FlowLockedTracker(frame, corners, t0, paper="auto", scan_long_side=self.scan_long_side,
+                                           occluders=occ, fallback=fallback)
+            if self._lock.uses_fallback:
+                print("flow tracker: blank page, using the DocAligner tracker")
+        elif self.lock_backend in ("vision", "docaligner"):
             if self._model is None:
                 self._model = DocAlignerModel() if self.lock_backend == "docaligner" else None
             self._lock = VisionLockedTracker(self._last_frame, t.corners, self._last_t, paper="auto",
@@ -255,7 +272,7 @@ class DocumentTracker:
         self._last_frame, self._last_t = frame, t
         self._last_occluders = list(occluders or [])
         if self._lock is not None:
-            if self.lock_backend in ("vision", "docaligner"):
+            if self.lock_backend in ("vision", "docaligner", "flow"):
                 self._lock.update(frame, t, self.detector, occluders=self._last_occluders)
             else:
                 self._lock.update(frame, t, self.detector)
