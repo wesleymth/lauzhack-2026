@@ -5,7 +5,7 @@ lets Tk swallow the keyboard events, and OpenCV windows can't report a
 user-resized size. The app drives it from its own loop with `update()`.
 
 Keys work in every window: r release, o rotate, m mirror, s save, d debug,
-q / Esc quit. Camera window: left click = select, right click = release.
+v voice note recording on/off, p export PDF with the notes, q / Esc quit. Camera window: left click = select, right click = release.
 Scan window: freely resizable (its size is the warp size), Rotate / Mirror buttons.
 """
 
@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 KEYS = {"r": "release", "o": "rotate", "m": "mirror", "s": "save", "d": "debug",
-        "q": "quit", "Escape": "quit"}
+        "v": "voice", "p": "export", "q": "quit", "Escape": "quit"}
 BG = "#282828"
 
 

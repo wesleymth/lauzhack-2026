@@ -37,7 +37,31 @@ resizable. The warp is recomputed every frame at the window's current size, so t
 saves exactly that. It opens at the paper shape (A4) when a document is locked. Buttons: **Rotate 90°** (`o`)
 turns the document's orientation clockwise and swaps the window shape. **Mirror** (`m`) flips left-right. Both
 relabel the corners, so `tr.selected.corners` stays consistent with the scan.
-Keys work in every window: **Esc**/`q` quit, `r` release, `o` rotate, `m` mirror, `s` save scan PNG, `d` debug masks.
+Keys work in every window: **Esc**/`q` quit, `r` release, `o` rotate, `m` mirror, `s` save scan PNG, `d` debug masks, `v` voice notes on/off, `p` export the PDF with the notes.
+
+## Voice notes → commented PDF
+
+While a document is locked, press **`v`** to start recording, then talk and point at the page with your
+**right index finger** (pointing pose, as for selecting). Press **`v`** again to stop. Each spoken **sentence**
+becomes one note. It is pinned where your fingertip was on the page when the sentence began (word timestamps
+from `../speech/stt.py`, faster-whisper `small.en`, run locally). The scan window shows a numbered pin per
+note, your live fingertip, and a REC badge. Press **`p`** to export the flattened scan as a PDF (A4/Letter
+page) with one **sticky-note comment** per sentence. These open in any PDF viewer's comments panel. If
+recording is still running, `p` stops it and waits for transcription to finish first. A sentence spoken
+while your finger was off the page is still exported, stacked in the top-left corner and marked "(no pointer)".
+
+```bash
+uv run python -m doctrack.app                 # v / p work out of the box (system default mic)
+uv run python -m doctrack.app --camera-mic    # LogiInsight camera microphone (or --mic <index|name>)
+uv run python -m doctrack.app --voice-chunk 6 # notes appear sooner (default: transcribe every ~10 s)
+```
+
+Output goes to `voice_notes/<date_time>/`: `rec_NN/session.wav` and `rec_NN/transcript.json` for each recording,
+`pointer.jsonl` with fingertip samples, and `notes_<time>.pdf` with a `.json` alongside (note text + u, v
+on the page). Positions are kept in document coordinates, so rotating or mirroring the scan before
+exporting still puts the notes in the right place. Notes are kept after a release and cleared when a
+new document is locked. Options: `--note-hand Left`, `--keep-hand-labels` (don't swap MediaPipe's
+Left/Right, like Hand_tracker), `--no-voice`. On macOS, allow microphone access for your terminal.
 
 ## Library use (for another frontend)
 

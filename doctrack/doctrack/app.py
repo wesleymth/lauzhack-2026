@@ -10,10 +10,16 @@ While locked, only that document is tracked and it is never dropped.
 Scan window: freely resizable; the warp is recomputed at the window's size, so
 the scan always fills it. Buttons (or keys): Rotate 90 (o), Mirror (m).
 Keys (any window): Esc/q quit, r release, o rotate, m mirror, s save scan PNG, d debug.
+
+Voice notes (locked document): v starts/stops recording. Each spoken sentence
+becomes a note pinned where your RIGHT index finger points (pointing pose) on
+the page when the sentence begins. p exports the scan as a PDF with one
+comment per note (voice_notes/<date_time>/). See voice.py.
 """
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -56,7 +62,7 @@ def open_source(args):
         return cap
 
 
-def draw(frame, tracker, fps):
+def draw(frame, tracker, fps, extra=""):
     out = frame.copy()
     locked = tracker.locked
     for t in tracker.tracks:
@@ -74,7 +80,7 @@ def draw(frame, tracker, fps):
         cv2.putText(out, label, (cx - 20, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
     if locked:
         w, h = tracker.scan_size
-        status = f"{fps:5.1f} fps | LOCKED #{tracker.selected.id} ({w}x{h}) | r / right-click to release"
+        status = f"{fps:5.1f} fps | LOCKED #{tracker.selected.id} ({w}x{h}) | r / right-click to release{extra}"
     else:
         status = f"{fps:5.1f} fps | {len(tracker.tracks)} doc(s) | point at a document (1 s) or click"
     cv2.putText(out, status, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
@@ -94,6 +100,32 @@ def draw_hands(out, hands, connections, selector, t):
         c = tuple(int(v) for v in selector.tip)
         cv2.circle(out, c, 28, (80, 80, 80), 3, cv2.LINE_AA)
         cv2.ellipse(out, c, (28, 28), -90, 0, 360 * selector.progress(t), (0, 255, 0), 6, cv2.LINE_AA)
+
+
+def draw_notes(scan, notes, view, pointer_uv, recording):
+    """Numbered pins for the notes so far, the live fingertip, and a REC badge (display only)."""
+    from .voice import to_view
+    out = scan.copy()
+    h, w = out.shape[:2]
+    for n in notes:
+        if n.uv is None:
+            continue
+        u, v = to_view(n.uv, view)
+        c = (int(u * (w - 1)), int(v * (h - 1)))
+        cv2.circle(out, c, 13, (0, 200, 255), -1, cv2.LINE_AA)
+        cv2.circle(out, c, 13, (0, 0, 0), 2, cv2.LINE_AA)
+        label = str(n.index)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        cv2.putText(out, label, (c[0] - tw // 2, c[1] + th // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 0, 0), 2, cv2.LINE_AA)
+    if pointer_uv is not None:
+        u, v = to_view(pointer_uv, view)
+        c = (int(u * (w - 1)), int(v * (h - 1)))
+        cv2.circle(out, c, 9, (0, 0, 255) if recording else (0, 200, 0), 3, cv2.LINE_AA)
+    if recording:
+        cv2.circle(out, (22, 22), 9, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.putText(out, "REC", (38, 29), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+    return out
 
 
 def placeholder(w, h, text="point at / click a document"):
@@ -122,6 +154,17 @@ def main(argv=None):
                     help="any index fingertip on a document counts, not only the pointing gesture")
     ap.add_argument("--point-dir", choices=["any", "down", "up", "left", "right"], default="down",
                     help="required pointing direction in the image (as in Hand_tracker; default down)")
+    ap.add_argument("--no-voice", action="store_true", help="disable voice notes (v / p)")
+    ap.add_argument("--mic", help="microphone index or part of its name (default: system input; "
+                                  "list them with: cd ../speech && uv run python stt.py --list)")
+    ap.add_argument("--camera-mic", action="store_true", help="use the LogiInsight camera microphone")
+    ap.add_argument("--voice-chunk", type=float, default=10.0,
+                    help="seconds of audio per transcription chunk (smaller = notes appear sooner)")
+    ap.add_argument("--note-hand", choices=["Right", "Left"], default="Right",
+                    help="hand whose pointing index finger places the voice notes")
+    ap.add_argument("--keep-hand-labels", action="store_true",
+                    help="do NOT swap MediaPipe's Left/Right (as Hand_tracker --keep-labels)")
+    ap.add_argument("--notes-dir", default="voice_notes", help="where recordings and PDFs go")
     args = ap.parse_args(argv)
 
     cap = open_source(args)
@@ -132,11 +175,19 @@ def main(argv=None):
     if not args.no_hands:
         try:
             from .hands import DwellSelector, HandTracker
-            hand_tracker = HandTracker(point_dir=args.point_dir)
+            hand_tracker = HandTracker(point_dir=args.point_dir, swap_labels=not args.keep_hand_labels)
             selector = DwellSelector(dwell_s=args.dwell, require_pointing=not args.any_finger_pose)
             print(f"hand tracking on: point at a document for {args.dwell:g}s to select it")
         except Exception as e:  # mediapipe / model missing: fall back to clicking
             print(f"hand tracking unavailable ({e}); click to select")
+
+    voice = None
+    if not args.no_voice:
+        from .voice import VoiceNotes
+        voice = VoiceNotes(Path(args.notes_dir), mic=args.mic, camera_mic=args.camera_mic,
+                           chunk_s=args.voice_chunk)
+        if hand_tracker is None:
+            print("voice notes: no hand tracking, notes will not be pinned to a spot")
 
     def click(x, y):
         if tracker.locked:
@@ -149,6 +200,8 @@ def main(argv=None):
 
     def release():
         if tracker.locked:
+            if voice is not None:
+                voice.stop()             # notes are kept until another document is locked
             tracker.clear_selection()
             print("released")
 
@@ -174,13 +227,52 @@ def main(argv=None):
             cv2.imwrite(name, state["scan"])
             print(f"saved {name} ({state['scan'].shape[1]}x{state['scan'].shape[0]})")
 
+    def toggle_voice():
+        if voice is None:
+            return
+        if not tracker.locked and not voice.recording:
+            print("voice: lock a document first")
+            return
+        try:
+            voice.toggle()
+        except Exception as e:  # no mic / no access: keep the app running
+            print(f"voice: cannot record ({e})")
+
+    def export():
+        if voice is None:
+            return
+        frame = state.get("frame")
+        if not tracker.locked or frame is None:
+            print("export: lock a document first")
+            return
+        scan = tracker.scan(frame)                     # full paper-size scan, current orientation
+        view = tracker.view_transform()
+        voice.stop()
+        if not voice.recordings:
+            print("export: no voice notes yet (v to record)")
+        out_dir = voice.session_dir or Path(args.notes_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"notes_{time.strftime('%H-%M-%S')}.pdf"
+
+        def run():
+            from .voice import export_pdf
+            if voice.busy:
+                print("export: waiting for transcription to finish ...", flush=True)
+            voice.wait()
+            notes = voice.notes()
+            export_pdf(scan, notes, path, view=view, paper=args.paper)
+            placed = sum(n.uv is not None for n in notes)
+            print(f"exported {path} ({len(notes)} notes, {placed} pinned)", flush=True)
+        threading.Thread(target=run, daemon=True).start()
+
     def toggle_debug():
         state["debug"] = not state["debug"]
         if not state["debug"]:
             ui.show_debug(None)
 
     actions = dict(click=click, release=release, rotate=rotate, mirror=mirror, save=save,
-                   debug=toggle_debug, quit=lambda: state.update(quit=True))
+                   debug=toggle_debug, voice=toggle_voice, export=export,
+                   quit=lambda: state.update(quit=True))
     ui = UI(actions)
     fit_scan_window()
     was_locked = False
@@ -195,8 +287,10 @@ def main(argv=None):
                 ui.update()
                 continue
             now = time.perf_counter()
+            state["frame"] = frame
             hands = []
-            if hand_tracker is not None and not tracker.locked:   # only needed to select
+            # hands are needed to select (browse) and, with voice notes, to point while locked
+            if hand_tracker is not None and (not tracker.locked or voice is not None):
                 hands = hand_tracker.detect(frame, now)
             tracker.update(frame, now, occluders=[h.hull for h in hands])
             if selector is not None:
@@ -206,7 +300,22 @@ def main(argv=None):
             fps = 0.9 * fps + 0.1 * (1.0 / max(now - last, 1e-6))
             last = now
 
-            vis = draw(frame, tracker, fps)
+            if tracker.locked and not was_locked and voice is not None:
+                voice.reset()                      # new document: new set of notes
+            pointer_uv = None
+            if voice is not None and tracker.locked:
+                for h in hands:
+                    if h.handedness == args.note_hand and h.pointing:
+                        pointer_uv = tracker.to_doc(*h.tip)
+                        if pointer_uv is not None:
+                            voice.add_pointer(time.time(), pointer_uv)
+                            break
+
+            extra = ""
+            if voice is not None and tracker.locked:
+                n = len(voice.notes())
+                extra = (" | REC (v stop)" if voice.recording else " | v record") + f" | {n} note(s), p export"
+            vis = draw(frame, tracker, fps, extra)
             if hands:
                 draw_hands(vis, hands, hand_tracker.connections, selector, now)
             state["scale"] = min(1.0, args.display_width / float(vis.shape[1]))
@@ -222,6 +331,8 @@ def main(argv=None):
             ww, wh = ui.scan.size()
             scan = tracker.scan(frame, size=(ww, wh))
             state["scan"] = scan
+            if scan is not None and voice is not None:
+                scan = draw_notes(scan, voice.notes(), tracker.view_transform(), pointer_uv, voice.recording)
             ui.scan.show(scan if scan is not None else placeholder(ww, wh))
             ui.scan.set_state(tracker.locked, tracker.mirrored)
 
@@ -231,6 +342,10 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
+        if voice is not None and voice.recordings:
+            voice.stop()
+            print("voice: saving recordings ...")
+            voice.wait(timeout=60)
         cap.release()
         if hand_tracker is not None:
             hand_tracker.close()

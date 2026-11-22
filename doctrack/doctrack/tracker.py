@@ -21,6 +21,8 @@ from .filters import OneEuroFilter
 from .geometry import point_in_quad, quad_area, quad_iou, warp_document
 from .locked import LockedTracker
 
+_UNIT = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)  # TL TR BR BL
+
 
 @dataclass
 class Track:
@@ -144,6 +146,24 @@ class DocumentTracker:
         if self._lock is None:
             return None
         return warp_document(frame, self._lock.corners[self._perm], size=size or self.scan_size)
+
+    def to_doc(self, x: float, y: float) -> Optional[Tuple[float, float]]:
+        """Image point -> normalised coords (u, v in [0, 1]) on the locked document, in the
+        LOCK-TIME corner order (unaffected by later rotate / mirror; see view_transform).
+        None if not locked or the point is off the page."""
+        if self._lock is None:
+            return None
+        H = cv2.getPerspectiveTransform(self._lock.corners.astype(np.float32), _UNIT)
+        p = H @ np.array([x, y, 1.0])
+        if abs(p[2]) < 1e-12:
+            return None
+        u, v = p[0] / p[2], p[1] / p[2]
+        return (float(u), float(v)) if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0 else None
+
+    def view_transform(self) -> np.ndarray:
+        """3x3 map from lock-time doc coords (to_doc) to the scan's current orientation:
+        (u, v) there times the scan size is the pixel in `scan()`."""
+        return cv2.getPerspectiveTransform(_UNIT[self._perm], _UNIT)
 
     # ------------------------------ update -------------------------------- #
     def update(self, frame: np.ndarray, t: Optional[float] = None,
