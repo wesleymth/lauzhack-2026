@@ -26,6 +26,13 @@ not gone, so it doesn't vanish while you point at it.
 
 **Browse mode:** calm on purpose (a desk is a slow scene). A document is only shown after it has been
 detected confidently for about 1/3 s. At most 3 are shown, and they are smoothed heavily. **Left click** one to lock.
+**Locked mode, macOS (default):** the selected page is tracked with Apple's pretrained document detector
+(Vision, about 5 ms per frame) run on a crop around the page. A result is used only if it is confident and has the
+page's size, shape and content. With a hand on the page (from the hand tracker), the outline holds still. If the
+page area hasn't changed, the outline doesn't move at all. If the page disappears, it is searched for with wider
+crops and halves of the frame. See `doctrack/vision_track.py`. Use `DocumentTracker(..., lock_backend="classic")`
+for the OpenCV tracker described below (used automatically where Vision isn't available).
+
 **Locked mode:** only that document is tracked and it is never dropped. Each corner is handled on its own: a
 corner covered by a hand or pen (hollow circle) keeps its **last position**, and that position is used for the warp.
 This works for 1, 2, 3 or all 4 corners. When uncovered, it is searched for starting at its last position and going
@@ -37,7 +44,51 @@ resizable. The warp is recomputed every frame at the window's current size, so t
 saves exactly that. It opens at the paper shape (A4) when a document is locked. Buttons: **Rotate 90°** (`o`)
 turns the document's orientation clockwise and swaps the window shape. **Mirror** (`m`) flips left-right. Both
 relabel the corners, so `tr.selected.corners` stays consistent with the scan.
-Keys work in every window: **Esc**/`q` quit, `r` release, `o` rotate, `m` mirror, `s` save scan PNG, `d` debug masks.
+Keys work in every window: **Esc**/`q` quit, `r` release, `o` rotate, `m` mirror, `s` save scan PNG, `d` debug masks, `v` voice notes on/off, `p` export the PDF with the notes.
+
+## Voice notes → commented PDF
+
+While a document is locked, press **`v`** to start recording, then talk and point at the page with your
+**right index finger** (pointing pose: index straight, other fingers curled, in any direction). Press **`v`**
+again to stop. Each spoken **sentence** starts a note, pinned where your fingertip was on the page when the
+sentence began (word timestamps from `../speech/stt.py`, faster-whisper `small.en`, run locally). A sentence
+spoken with no fingertip on the page goes into the **same comment as the last fingertip position**: the
+previous comment, or a new one at the spot you last pointed to if you pointed somewhere else in between.
+MediaPipe's Left/Right label is unreliable from above, so it only sets priority: if the right hand isn't
+pointing at the page, the other hand is used. While locked, each hand is labelled with why it's not pointing,
+the status line shows `finger: on page` or the reason, and stopping a recording prints how often the
+fingertip was found. The scan window shows a numbered pin per
+note, your live fingertip, and a REC badge. Press **`p`** to export the flattened scan as a PDF (A4/Letter
+page) with one **sticky-note comment** per sentence. These open in any PDF viewer's comments panel. If
+recording is still running, `p` stops it and waits for transcription to finish first. If the finger was never seen
+on the page, the text is exported in the top-left corner, marked "(no pointer)".
+
+```bash
+uv run python -m doctrack.app                 # v / p work out of the box (system default mic)
+uv run python -m doctrack.app --camera-mic    # LogiInsight camera microphone (or --mic <index|name>)
+uv run python -m doctrack.app --voice-chunk 6 # notes appear sooner (default: transcribe every ~10 s)
+```
+
+**Clean-up at export (OCR + local LLM):** before writing the PDF, the scan is OCR'd (`../ocr`, PaddleOCR
+PP-OCRv6 tiny). Parts of a note that only read the page out ("Budget 1200 CHF for hardware, that's too low"
+becomes "that's too low") are removed by word matching against the OCR text, and a note with nothing new
+is dropped. Then **`qwen3:0.6b`** in Ollama writes a **Summary** comment (top-right of the page, also in the
+PDF's Subject). It is unloaded right after (`keep_alive: 0`). If Ollama isn't running, the export still
+works, without a summary. Setup: `ollama pull qwen3:0.6b`. Options: `--llm-model <name>`, `--no-llm` (notes as
+spoken, no OCR), `--ollama-url`. The spoken text stays in the `.json` (`original`), and the OCR text and
+summary are saved in `notes_<time>.llm.json`.
+
+While it exports, a **progress popup** shows the current step (transcribing the last words, OCR, summary,
+writing the PDF) with a progress bar. When it's done, it shows where the file was saved, with **Open PDF** and
+**Show in Finder** buttons. Pressing `p` again while an export is running does nothing.
+The PDF is also copied to **`~/Downloads`** as `voice-notes_<date_time>_<time>.pdf` (`name (1).pdf` if the name is
+taken, like a browser download). Change it with `--download-dir <folder>`, or turn it off with `--download-dir ''`.
+Output goes to `voice_notes/<date_time>/`: `rec_NN/session.wav` and `rec_NN/transcript.json` for each recording,
+`pointer.jsonl` with fingertip samples, and `notes_<time>.pdf` with a `.json` alongside (note text + u, v
+on the page). Positions are kept in document coordinates, so rotating or mirroring the scan before
+exporting still puts the notes in the right place. Notes are kept after a release and cleared when a
+new document is locked. Options: `--note-hand Left|any`, `--note-any-pose` (any index fingertip on the page counts), `--keep-hand-labels` (don't swap MediaPipe's
+Left/Right, like Hand_tracker), `--no-voice`. On macOS, allow microphone access for your terminal.
 
 ## Library use (for another frontend)
 
