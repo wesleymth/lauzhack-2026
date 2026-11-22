@@ -5,11 +5,14 @@ lets Tk swallow the keyboard events, and OpenCV windows can't report a
 user-resized size. The app drives it from its own loop with `update()`.
 
 Keys work in every window: r release, o rotate, m mirror, s save, d debug,
-q / Esc quit. Camera window: left click = select, right click = release.
+v voice note recording on/off, p export PDF with the notes, q / Esc quit. Camera window: left click = select, right click = release.
 Scan window: freely resizable (its size is the warp size), Rotate / Mirror buttons.
 """
 
+import subprocess
+import sys
 import tkinter as tk
+from tkinter import ttk
 from typing import Callable, Dict, Optional, Tuple
 
 import cv2
@@ -17,7 +20,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 KEYS = {"r": "release", "o": "rotate", "m": "mirror", "s": "save", "d": "debug",
-        "q": "quit", "Escape": "quit"}
+        "v": "voice", "p": "export", "q": "quit", "Escape": "quit"}
 BG = "#282828"
 
 
@@ -48,6 +51,7 @@ class UI:
         self.scan.top.protocol("WM_DELETE_WINDOW", self._quit)
         self.scan.set_content_size(*scan_size)
 
+        self._export: Optional["ExportPopup"] = None
         self._debug_top: Optional[tk.Toplevel] = None
         self._debug_view = None
         self._debug_photo = None
@@ -86,6 +90,18 @@ class UI:
         self._debug_photo = _photo(img)
         self._debug_view.configure(image=self._debug_photo)
 
+    def show_export(self, progress) -> None:
+        """Draw the export progress popup (`progress`: app.ExportProgress, or None = nothing to show)."""
+        if progress is None:
+            return
+        if self._export is None or self._export.progress is not progress:   # a new export
+            if self._export is not None:
+                self._export.close()
+            self._export = ExportPopup(self.root)
+            self._export.progress = progress
+        if self._export.alive:                     # closed by the user: stays closed
+            self._export.render(progress)
+
     def update(self) -> None:
         if self.closed:
             return
@@ -98,6 +114,77 @@ class UI:
         self.closed = True
         try:
             self.root.destroy()
+        except tk.TclError:
+            pass
+
+
+class ExportPopup:
+    """Small always-on-top window: stage text, progress bar, elapsed time; then the result
+    with Open / Show in Finder buttons."""
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.top = tk.Toplevel(root)
+        self.top.title("Exporting PDF")
+        self.top.resizable(False, False)
+        self.top.attributes("-topmost", True)
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        frame = tk.Frame(self.top, padx=18, pady=14)
+        frame.pack(fill="both", expand=True)
+        self._title = tk.Label(frame, text="Exporting PDF ...", font=("TkDefaultFont", 13, "bold"),
+                               anchor="w")
+        self._title.pack(fill="x")
+        self._stage = tk.Label(frame, text="", anchor="w", width=46)
+        self._stage.pack(fill="x", pady=(6, 4))
+        self._bar = ttk.Progressbar(frame, length=360, maximum=100, mode="determinate")
+        self._bar.pack(fill="x")
+        self._detail = tk.Label(frame, text="", anchor="w", fg="#777777", wraplength=360, justify="left")
+        self._detail.pack(fill="x", pady=(4, 0))
+        self._buttons = tk.Frame(frame)
+        self._buttons.pack(fill="x", pady=(10, 0))
+        self._shown_done = False
+        self.alive = True
+        self.progress = None
+        # centre on the screen
+        self.top.update_idletasks()
+        w, h = self.top.winfo_reqwidth(), self.top.winfo_reqheight()
+        x = (self.top.winfo_screenwidth() - w) // 2
+        y = (self.top.winfo_screenheight() - h) // 3
+        self.top.geometry(f"+{x}+{y}")
+
+    def render(self, p) -> None:
+        if not self.alive or self._shown_done:
+            return
+        label, frac, detail = p.status()
+        if p.done or p.error:
+            self._finish(p)
+            return
+        self._stage.configure(text=label)
+        self._bar.configure(value=100 * frac)
+        self._detail.configure(text=detail)
+
+    def _finish(self, p) -> None:
+        self._shown_done = True
+        self._bar.configure(value=100)
+        if p.error:
+            self._title.configure(text="Export failed")
+            self._stage.configure(text=p.error)
+            self._detail.configure(text="")
+        else:
+            path = p.download or p.path
+            self._title.configure(text="PDF exported")
+            self._stage.configure(text=f"{p.notes} comment(s){' + summary' if p.summary else ''}")
+            self._detail.configure(text=f"Saved to {path}")
+            if sys.platform == "darwin":
+                ttk.Button(self._buttons, text="Open PDF",
+                           command=lambda: subprocess.Popen(["open", str(path)])).pack(side="left")
+                ttk.Button(self._buttons, text="Show in Finder",
+                           command=lambda: subprocess.Popen(["open", "-R", str(path)])).pack(side="left", padx=6)
+        ttk.Button(self._buttons, text="Close", command=self.close).pack(side="right")
+
+    def close(self) -> None:
+        self.alive = False
+        try:
+            self.top.destroy()
         except tk.TclError:
             pass
 

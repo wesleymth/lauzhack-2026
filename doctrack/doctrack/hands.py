@@ -29,6 +29,8 @@ class Hand:
     handedness: str
     pointing: bool
     reason: str = ""
+    pointing_any_dir: bool = False     # pointing pose, whatever the direction (voice notes)
+    reason_any_dir: str = ""
 
     @property
     def tip(self) -> np.ndarray:
@@ -43,7 +45,8 @@ class Hand:
 class HandTracker:
     def __init__(self, model_path: Optional[str] = None, max_hands: int = 2, width: int = 640,
                  point_dir: str = "down", dir_tolerance: float = 60.0,
-                 straight_deg: float = 150.0, pinch_ratio: float = 0.45) -> None:
+                 straight_deg: float = 150.0, pinch_ratio: float = 0.45,
+                 swap_labels: bool = True) -> None:
         import mediapipe as mp
         from mediapipe.tasks import python as mp_python
         from mediapipe.tasks.python import vision
@@ -68,6 +71,10 @@ class HandTracker:
         self.width = width
         self._gesture = SimpleNamespace(point_dir=point_dir, dir_tolerance=dir_tolerance,
                                         straight_deg=straight_deg, pinch_ratio=pinch_ratio)
+        self._gesture_any = SimpleNamespace(**{**vars(self._gesture), "point_dir": "any"})
+        # MediaPipe labels assume a mirrored selfie image; this desk camera is not mirrored,
+        # so Left/Right are swapped by default (as in Hand_tracker, unless --keep-labels).
+        self.swap_labels = swap_labels
         self._t0 = time.perf_counter()
         self._last_ms = -1
 
@@ -86,7 +93,11 @@ class HandTracker:
         for lm, hd in zip(res.hand_landmarks, res.handedness):
             pts = np.array([[p.x * w, p.y * h] for p in lm], np.float32)
             pointing, reason = self._hr.pointing_check(lm, w, h, self._gesture)
-            hands.append(Hand(pts, hd[0].category_name, bool(pointing), reason))
+            label = hd[0].category_name
+            if self.swap_labels:
+                label = {"Left": "Right", "Right": "Left"}.get(label, label)
+            any_dir, reason_any = self._hr.pointing_check(lm, w, h, self._gesture_any)
+            hands.append(Hand(pts, label, bool(pointing), reason, bool(any_dir), reason_any))
         return hands
 
     def close(self) -> None:
