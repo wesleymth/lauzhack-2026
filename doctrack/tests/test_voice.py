@@ -62,8 +62,13 @@ def test_export_pdf_annotations(tmp_path):
     page = pypdf.PdfReader(str(path)).pages[0]
     w, h = float(page.mediabox.width), float(page.mediabox.height)
     assert (w, h) == pytest.approx((595.3, 841.9), abs=1.5)        # A4 in points
-    annots = [a.get_object() for a in page["/Annots"]]
-    assert [a["/Subtype"] for a in annots] == ["/Text", "/Text"]
+    every = [a.get_object() for a in page["/Annots"]]
+    assert [a["/Subtype"] for a in every] == ["/Text", "/Popup", "/Text", "/Popup"]
+    annots = [a for a in every if a["/Subtype"] == "/Text"]
+    for a in annots:   # viewers like Preview need the linked popup + spec /F flags to show the text
+        assert a["/Popup"].get_object()["/Parent"].get_object() is a or \
+            a["/Popup"].get_object()["/Parent"].idnum == a.indirect_reference.idnum
+        assert a["/F"] & 4 and "/Flags" not in a
     assert annots[0]["/Contents"] == "Fix this title."
     x0, y0, x1, y1 = [float(v) for v in annots[0]["/Rect"]]
     assert ((x0 + x1) / 2, (y0 + y1) / 2) == pytest.approx((0.25 * w, 0.9 * h), abs=0.5)
