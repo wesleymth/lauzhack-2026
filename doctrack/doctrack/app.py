@@ -26,6 +26,7 @@ comment per note (voice_notes/<date_time>/). See voice.py.
 
 import argparse
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -165,9 +166,16 @@ class ExportProgress:
         self.lines = []                            # debug transcript: (text, tag), append-only
         self.model = ""
 
+    # ANSI colours for the export trace in the terminal
+    COLORS = {"header": "\033[1;34m", "info": "\033[90m", "ocr": "\033[0m", "keep": "\033[32m",
+              "drop": "\033[31m", "llm": "\033[35m"}
+
     def log(self, text: str, tag: str = "info") -> None:
-        """Debug window text (called from the export thread; the UI reads it each frame)."""
+        """Export trace (OCR text, kept / dropped comments, the LLM writing live), printed to the
+        terminal as it happens. Called from the export thread."""
         self.lines.append((text, tag))
+        color = self.COLORS.get(tag, "") if sys.stdout.isatty() else ""
+        print(f"{color}{text}\033[0m" if color else text, end="", flush=True)
 
     def stage(self, name: str) -> None:
         self.current, self.t_stage = name, time.time()
@@ -200,9 +208,55 @@ def to_downloads(pdf: Path, folder: Path, stem: str = None) -> Path:
     return dest
 
 
+def draw_rec_badge(vis, started_epoch):
+    """Teacher view while recording: red dot + REC + elapsed time, top right (blinking dot)."""
+    secs = max(0, int(time.time() - started_epoch)) if started_epoch else 0
+    text = f"REC {secs // 60:02d}:{secs % 60:02d}"
+    scale = vis.shape[1] / 1280.0
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0 * scale, max(1, int(2 * scale)))
+    x, y = vis.shape[1] - tw - int(40 * scale), int(40 * scale)
+    if int(time.time() * 2) % 2 == 0:
+        cv2.circle(vis, (x - int(18 * scale), y - th // 2), int(10 * scale), (0, 0, 255), -1, cv2.LINE_AA)
+    cv2.putText(vis, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1.0 * scale, (0, 0, 0), max(2, int(5 * scale)),
+                cv2.LINE_AA)
+    cv2.putText(vis, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1.0 * scale, (0, 0, 255), max(1, int(2 * scale)),
+                cv2.LINE_AA)
+
+
+def draw_toast(vis, toast, hold=2.5, fade=1.5):
+    """A message at the bottom centre that stays `hold` s, then fades out over `fade` s."""
+    if not toast:
+        return
+    text, t0 = toast
+    age = time.time() - t0
+    alpha = 1.0 if age < hold else max(0.0, 1.0 - (age - hold) / fade)
+    if alpha <= 0:
+        return
+    scale = vis.shape[1] / 1280.0
+    font, fs, thick = cv2.FONT_HERSHEY_SIMPLEX, 1.1 * scale, max(1, int(2 * scale))
+    (tw, th), _ = cv2.getTextSize(text, font, fs, thick)
+    pad = int(16 * scale)
+    x0, y1 = (vis.shape[1] - tw) // 2 - pad, vis.shape[0] - int(40 * scale)
+    y0, x1 = y1 - th - 2 * pad, x0 + tw + 2 * pad
+    over = vis.copy()
+    cv2.rectangle(over, (x0, y0), (x1, y1), (40, 120, 40), -1)
+    cv2.putText(over, text, (x0 + pad, y1 - pad), font, fs, (255, 255, 255), thick, cv2.LINE_AA)
+    cv2.addWeighted(over, alpha, vis, 1 - alpha, 0, dst=vis)
+
+
 def placeholder(w, h, text="point at / click a document"):
     img = np.full((h, w, 3), 40, np.uint8)
     cv2.putText(img, text, (20, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
+    return img
+
+
+def student_idle(frame, faces, w, h):
+    """Student window with no document locked: the usual dark placeholder, plus a live
+    thumbnail of each recognised face (bottom right) when faces are on."""
+    img = placeholder(w, h)
+    if faces:
+        from .faces import draw_thumbs
+        draw_thumbs(img, frame, faces, size=0.35)
     return img
 
 
@@ -242,8 +296,8 @@ def main(argv=None):
     ap.add_argument("--doc-up", choices=["down", "up", "left", "right"], default="down",
                     help="where the top of the document points in the camera image "
                          "(default down: page faces the user, top towards the keyboard)")
-    ap.add_argument("--display-width", type=int, default=1280, help="camera window width")
-    ap.add_argument("--scan-display-height", type=int, default=720, help="scan window height")
+    ap.add_argument("--display-width", type=int, default=0,
+                    help="camera (teacher) window width; default: fit the left 2/3 of the screen")
     ap.add_argument("--no-hands", action="store_true", help="disable hand tracking (click only)")
     ap.add_argument("--dwell", type=float, default=1.0, help="seconds to point at a document to select it")
     ap.add_argument("--any-finger-pose", action="store_true",
@@ -275,6 +329,8 @@ def main(argv=None):
     ap.add_argument("--no-llm", dest="llm_model", action="store_const", const="",
                     help="same as --llm-model ''")
     ap.add_argument("--ollama-url", default="http://localhost:11434")
+    ap.add_argument("--no-open-pdf", dest="open_pdf", action="store_false",
+                    help="don't open the PDF when an export finishes")
     ap.add_argument("--download-dir", default="~/Downloads",
                     help="the exported PDF is also copied here ('' = don't)")
     ap.add_argument("--faces", action="store_true",
@@ -332,16 +388,15 @@ def main(argv=None):
             print("released")
 
     def fit_scan_window():
-        """Start a newly locked document at its paper shape, --scan-display-height tall."""
-        w, h = tracker.scan_size or (int(args.scan_display_height / 2 ** 0.5), args.scan_display_height)
-        k = args.scan_display_height / float(h)
-        ui.scan.set_content_size(int(w * k), int(h * k))
+        """Locked document: student window at the paper shape, as large as the student area
+        (right third of the screen) allows."""
+        ui.fit_student(tracker.scan_size or (1000, int(1000 * 2 ** 0.5)))
 
     def rotate():
         if tracker.locked:
             w, h = ui.scan.size()
             tracker.rotate(1)
-            ui.scan.set_content_size(h, w)       # content turns 90 deg: swap the window shape
+            ui.fit_student((h, w))               # content turns 90 deg: swap the window shape
 
     def mirror():
         if tracker.locked:
@@ -481,6 +536,8 @@ def main(argv=None):
                 progress.log(f"\nPDF written: {progress.download or path}\n", "header")
                 progress.notes, progress.summary = len(notes), bool(summary)
                 progress.done = True
+                if args.open_pdf and sys.platform == "darwin":
+                    subprocess.Popen(["open", str(progress.download or path)])   # show the result
             except Exception as e:  # shown in the popup instead of dying silently in the thread
                 progress.error = f"{type(e).__name__}: {e}"
                 progress.log(f"\nexport failed: {progress.error}\n", "drop")
@@ -519,9 +576,10 @@ def main(argv=None):
                    share_pdf=share_pdf, share_pdf_notes=share_pdf_notes,
                    quit=lambda: state.update(quit=True))
     ui = UI(actions)
+    ui.layout()                                  # teacher view left 2/3, student view right 1/3
     cmds = queue.Queue()
     start_control_server(cmds)
-    fit_scan_window()
+    ui.fit_student()                             # idle: the whole student area (live camera)
     was_locked = False
 
     def run_remote_commands():
@@ -583,6 +641,13 @@ def main(argv=None):
                 extra = (" | REC (v stop)" if voice.recording else " | v record") + f" | {n} note(s), p export"
                 extra += " | finger: " + ("on page" if pointer_uv is not None else pointer_status)
             vis = draw(frame, tracker, fps, extra)
+            if voice is not None and voice.recording:
+                draw_rec_badge(vis, voice.recordings[-1].transcript.session_start_epoch)
+            exp = state.get("export")
+            if exp is not None and exp.done and not getattr(exp, "toasted", False):
+                exp.toasted = True                 # export just finished: fading message
+                state["toast"] = ("PDF exported successfully", time.time())
+            draw_toast(vis, state.get("toast"))
             if hands:
                 draw_hands(vis, hands, hand_tracker.connections, selector, now,
                            pointer_hand=pointer_hand, labels=tracker.locked)
@@ -591,7 +656,11 @@ def main(argv=None):
                 from .faces import draw as draw_faces
                 faces = face_rec.identify(frame)
                 draw_faces(vis, faces)
-            state["scale"] = min(1.0, args.display_width / float(vis.shape[1]))
+            if args.display_width:
+                state["scale"] = min(1.0, args.display_width / float(vis.shape[1]))
+            else:                                  # fit the teacher area (left 2/3 of the screen)
+                _, _, tw, th = ui.teacher_area
+                state["scale"] = min(1.0, tw / float(vis.shape[1]), th / float(vis.shape[0]))
             if state["scale"] < 1.0:
                 vis = cv2.resize(vis, None, fx=state["scale"], fy=state["scale"],
                                  interpolation=cv2.INTER_AREA)
@@ -599,6 +668,8 @@ def main(argv=None):
 
             if tracker.locked and not was_locked:
                 fit_scan_window()                  # new document: start at its paper shape
+            elif was_locked and not tracker.locked:
+                ui.fit_student()                   # released: back to the full student area
             was_locked = tracker.locked
             # the warp is recomputed at the window's current size: it always fills the window
             ww, wh = ui.scan.size()
@@ -610,7 +681,9 @@ def main(argv=None):
                 from .faces import draw_thumbs
                 scan = scan.copy()                 # keep state["scan"] clean: the s key saves it
                 draw_thumbs(scan, frame, faces, size=0.2)
-            ui.scan.show(scan if scan is not None else placeholder(ww, wh))
+            if scan is None:                       # idle student view: the live camera, not a blank
+                scan = student_idle(frame, faces, ww, wh)
+            ui.scan.show(scan)
             ui.scan.set_state(tracker.locked, tracker.mirrored)
 
             if state["debug"] and tracker.detector.debug:
