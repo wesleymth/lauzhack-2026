@@ -62,6 +62,20 @@ uv run python -m doctrack.app --camera-mic    # LogiInsight camera microphone (o
 uv run python -m doctrack.app --voice-chunk 6 # notes appear sooner (default: transcribe every ~10 s)
 ```
 
+**Clean-up at export (OCR + local LLM):** before writing the PDF, the scan is OCR'd (`../ocr`, PaddleOCR
+PP-OCRv6 tiny). Parts of a note that only read the page out ("Budget 1200 CHF for hardware, that's too low"
+becomes "that's too low") are removed by word matching against the OCR text, and a note with nothing new
+is dropped. Then **`qwen3:0.6b`** in Ollama writes a **Summary** comment (top-right of the page, also in the
+PDF's Subject). It is unloaded right after (`keep_alive: 0`). If Ollama isn't running, the export still
+works, without a summary. Setup: `ollama pull qwen3:0.6b`. Options: `--llm-model <name>`, `--no-llm` (notes as
+spoken, no OCR), `--ollama-url`. The spoken text stays in the `.json` (`original`), and the OCR text and
+summary are saved in `notes_<time>.llm.json`.
+
+While it exports, a **progress popup** shows the current step (transcribing the last words, OCR, summary,
+writing the PDF) with a progress bar. When it's done, it shows where the file was saved, with **Open PDF** and
+**Show in Finder** buttons. Pressing `p` again while an export is running does nothing.
+The PDF is also copied to **`~/Downloads`** as `voice-notes_<date_time>_<time>.pdf` (`name (1).pdf` if the name is
+taken, like a browser download). Change it with `--download-dir <folder>`, or turn it off with `--download-dir ''`.
 Output goes to `voice_notes/<date_time>/`: `rec_NN/session.wav` and `rec_NN/transcript.json` for each recording,
 `pointer.jsonl` with fingertip samples, and `notes_<time>.pdf` with a `.json` alongside (note text + u, v
 on the page). Positions are kept in document coordinates, so rotating or mirroring the scan before

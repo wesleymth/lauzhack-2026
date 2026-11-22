@@ -118,13 +118,15 @@ class Note:
     start: float                            # wall-clock epoch of the first word
     end: float
     uv: Optional[Tuple[float, float]]       # lock-frame doc coords; None = finger not on the page
+    original: Optional[str] = None          # what was said, when `text` was rewritten (refine.py)
 
     def to_dict(self, uv_view=None) -> dict:
         uv = uv_view if uv_view is not None else self.uv
         return {"index": self.index, "text": self.text,
                 "start_epoch": round(self.start, 3), "end_epoch": round(self.end, 3),
                 "u": None if uv is None else round(float(uv[0]), 4),
-                "v": None if uv is None else round(float(uv[1]), 4)}
+                "v": None if uv is None else round(float(uv[1]), 4),
+                **({"original": self.original} if self.original else {})}
 
 
 # --------------------------------------------------------------------------- #
@@ -390,7 +392,8 @@ def page_long_side(paper: str, w: int, h: int) -> float:
 
 
 def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
-               view: Optional[np.ndarray] = None, paper: str = "a4") -> Path:
+               view: Optional[np.ndarray] = None, paper: str = "a4",
+               summary: Optional[str] = None) -> Path:
     """Write the scan as a 1-page PDF with one sticky-note comment per note.
 
     `view`: 3x3 map from lock-frame doc coords to the scan's current orientation
@@ -413,6 +416,15 @@ def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
     Image.fromarray(cv2.cvtColor(scan_bgr, cv2.COLOR_BGR2RGB)).save(buf, "PDF", resolution=dpi)
     buf.seek(0)
     writer = PdfWriter(clone_from=PdfReader(buf))
+
+    if summary:     # summary comment in the top-right corner, opened by default
+        x, y = 0.96 * pw, 0.97 * ph
+        annot = Text(rect=(x - 12, y - 12, x + 12, y + 12), text=summary, open=True)
+        annot[NameObject("/T")] = TextStringObject("Summary")
+        annot[NameObject("/Name")] = NameObject("/Key")
+        annot[NameObject("/C")] = ArrayObject([FloatObject(0.2), FloatObject(0.6), FloatObject(1.0)])
+        writer.add_annotation(page_number=0, annotation=annot)
+        writer.add_metadata({"/Subject": summary})
 
     records = []
     unplaced = 0
@@ -437,7 +449,7 @@ def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
     with open(path, "wb") as f:
         writer.write(f)
     path.with_suffix(".json").write_text(json.dumps(
-        {"page_pt": [round(pw, 2), round(ph, 2)], "notes": records}, indent=1, ensure_ascii=False))
+        {"page_pt": [round(pw, 2), round(ph, 2)], "summary": summary, "notes": records}, indent=1, ensure_ascii=False))
     return path
 
 

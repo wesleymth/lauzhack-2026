@@ -137,6 +137,57 @@ def draw_notes(scan, notes, view, pointer_uv, recording):
     return out
 
 
+class ExportProgress:
+    """Export state shared between the export thread (calls `stage`) and the UI (`status`).
+
+    Each stage has a weight in the bar and a typical duration: within a stage the bar
+    advances with elapsed time up to 95% of the stage, so it keeps moving on slow steps.
+    Skipped stages (no recording to wait for, no LLM) make the bar jump forward."""
+
+    STAGES = [  # name, label, weight, typical seconds
+        ("wait", "Transcribing the last words", 0.30, 12.0),
+        ("ocr", "Reading the page (OCR)", 0.35, 10.0),
+        ("summary", "Writing the summary", 0.30, 8.0),
+        ("pdf", "Writing the PDF", 0.05, 1.0),
+    ]
+
+    def __init__(self, path: Path) -> None:
+        self.path, self.download = path, None
+        self.t0 = time.time()
+        self.current, self.t_stage = None, self.t0
+        self.done, self.error = False, None
+        self.notes, self.summary = 0, False
+
+    def stage(self, name: str) -> None:
+        self.current, self.t_stage = name, time.time()
+
+    def status(self):
+        """(label, fraction 0..1, detail) for the popup."""
+        names = [s[0] for s in self.STAGES]
+        if self.current not in names:
+            return "Starting ...", 0.0, ""
+        i = names.index(self.current)
+        _, label, weight, typical = self.STAGES[i]
+        base = sum(s[2] for s in self.STAGES[:i])
+        in_stage = min(0.95, (time.time() - self.t_stage) / typical)
+        detail = (f"step {i + 1} of {len(self.STAGES)} - {time.time() - self.t_stage:.0f} s"
+                  f" (total {time.time() - self.t0:.0f} s)")
+        return label + " ...", base + weight * in_stage, detail
+
+
+def to_downloads(pdf: Path, folder: Path) -> Path:
+    """Copy the exported PDF into the Downloads folder like a browser download:
+    `name.pdf`, or `name (1).pdf`, `name (2).pdf` ... if it already exists."""
+    import shutil
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = "voice-notes_" + pdf.parent.name + "_" + pdf.stem.replace("notes_", "")
+    dest, i = folder / f"{stem}.pdf", 1
+    while dest.exists():
+        dest, i = folder / f"{stem} ({i}).pdf", i + 1
+    shutil.copyfile(pdf, dest)
+    return dest
+
+
 def placeholder(w, h, text="point at / click a document"):
     img = np.full((h, w, 3), 40, np.uint8)
     cv2.putText(img, text, (20, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
@@ -177,6 +228,14 @@ def main(argv=None):
     ap.add_argument("--keep-hand-labels", action="store_true",
                     help="do NOT swap MediaPipe's Left/Right (as Hand_tracker --keep-labels)")
     ap.add_argument("--notes-dir", default="voice_notes", help="where recordings and PDFs go")
+    ap.add_argument("--llm-model", default="qwen3:0.6b",
+                    help="Ollama model for the summary. At export the page is OCR'd, note parts that "
+                         "repeat it are removed, and this model writes a summary ('' = notes as spoken)")
+    ap.add_argument("--no-llm", dest="llm_model", action="store_const", const="",
+                    help="same as --llm-model ''")
+    ap.add_argument("--ollama-url", default="http://localhost:11434")
+    ap.add_argument("--download-dir", default="~/Downloads",
+                    help="the exported PDF is also copied here ('' = don't)")
     args = ap.parse_args(argv)
 
     cap = open_source(args)
@@ -257,6 +316,10 @@ def main(argv=None):
         if not tracker.locked or frame is None:
             print("export: lock a document first")
             return
+        running = state.get("export")
+        if running is not None and not (running.done or running.error):
+            print("export: already running")
+            return
         scan = tracker.scan(frame)                     # full paper-size scan, current orientation
         view = tracker.view_transform()
         voice.stop()
@@ -266,15 +329,42 @@ def main(argv=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"notes_{time.strftime('%H-%M-%S')}.pdf"
 
+        progress = ExportProgress(path)
+        state["export"] = progress
+
         def run():
             from .voice import export_pdf
-            if voice.busy:
-                print("export: waiting for transcription to finish ...", flush=True)
-            voice.wait()
-            notes = voice.notes()
-            export_pdf(scan, notes, path, view=view, paper=args.paper)
-            placed = sum(n.uv is not None for n in notes)
-            print(f"exported {path} ({len(notes)} notes, {placed} pinned)", flush=True)
+            try:
+                if voice.busy:
+                    progress.stage("wait")
+                    print("export: waiting for transcription to finish ...", flush=True)
+                voice.wait()
+                notes = voice.notes()
+                summary = None
+                if args.llm_model:
+                    try:
+                        from .refine import refine_notes
+                        summary, notes = refine_notes(scan, notes, view, model=args.llm_model,
+                                                      url=args.ollama_url, log_path=path.with_suffix(".llm.json"),
+                                                      on_stage=progress.stage)
+                    except Exception as e:  # OCR failed...: plain notes
+                        print(f"refine: skipped ({type(e).__name__}: {e}); exporting the notes as spoken",
+                              flush=True)
+                progress.stage("pdf")
+                export_pdf(scan, notes, path, view=view, paper=args.paper, summary=summary)
+                placed = sum(n.uv is not None for n in notes)
+                print(f"exported {path} ({len(notes)} notes, {placed} pinned)", flush=True)
+                if args.download_dir:
+                    try:
+                        progress.download = to_downloads(path, Path(args.download_dir).expanduser())
+                        print(f"saved to {progress.download}", flush=True)
+                    except OSError as e:
+                        print(f"could not copy the PDF to {args.download_dir}: {e}", flush=True)
+                progress.notes, progress.summary = len(notes), bool(summary)
+                progress.done = True
+            except Exception as e:  # shown in the popup instead of dying silently in the thread
+                progress.error = f"{type(e).__name__}: {e}"
+                print(f"export failed: {progress.error}", flush=True)
         threading.Thread(target=run, daemon=True).start()
 
     def toggle_debug():
@@ -350,6 +440,7 @@ def main(argv=None):
 
             if state["debug"] and tracker.detector.debug:
                 ui.show_debug(np.hstack(list(tracker.detector.debug.values())))
+            ui.show_export(state.get("export"))   # progress popup (Tk: main thread only)
             ui.update()                            # handles clicks, buttons and keys
     except KeyboardInterrupt:
         pass
