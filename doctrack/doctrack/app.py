@@ -11,6 +11,9 @@ Scan window: freely resizable; the warp is recomputed at the window's size, so
 the scan always fills it. Buttons (or keys): Rotate 90 (o), Mirror (m).
 Keys (any window): Esc/q quit, r release, o rotate, m mirror, s save scan PNG, d debug.
 
+Remote control (e.g. the Logitech plugin), POST on http://127.0.0.1:8765/
+    rotate, mirror, release, save, quit, format/<auto|a4p|a4l|photo>
+    
 Voice notes (locked document): v starts/stops recording. Each spoken sentence
 becomes a note pinned where your RIGHT index finger points (pointing pose) on
 the page when the sentence begins. p exports the scan as a PDF with one
@@ -18,22 +21,27 @@ comment per note (voice_notes/<date_time>/). See voice.py.
 """
 
 import argparse
+import queue
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from .detector import DetectorConfig, OpenCVDocumentDetector
-from .ui import UI
 from .tracker import DocumentTracker
+from .ui import UI
 
 CORNER_COLORS = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)]  # doc TL TR BR BL (BGR)
 CORNER_NAMES = ["TL", "TR", "BR", "BL"]
 STATE_COLORS = {"tracking": (0, 255, 0), "partial": (0, 220, 255), "covered": (0, 220, 255), "searching": (0, 120, 255)}
 SDK_DIR = Path(__file__).resolve().parents[2] / "logiinsight_api"
+
+FORMATS = ("auto", "a4p", "a4l", "photo")
+REMOTE_COMMANDS = ("rotate", "mirror", "release", "save", "quit")
 
 
 def open_source(args):
@@ -194,14 +202,38 @@ def placeholder(w, h, text="point at / click a document"):
     return img
 
 
+def start_control_server(cmds, port=8765):
+    """Tiny local server: POST /rotate, /mirror, /release, /save, /quit, /format/<name>
+    -> queued for the main loop (all UI work stays on the main thread)."""
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            name = self.path.strip("/")
+            ok = name in REMOTE_COMMANDS or \
+                (name.startswith("format/") and name.split("/", 1)[1] in FORMATS)
+            if ok:
+                cmds.put(name)
+            self.send_response(200 if ok else 404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):  # keep the console quiet
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", type=int, default=None, help="camera index (default: auto-find)")
     ap.add_argument("--video", help="read from a video file instead of a camera")
     ap.add_argument("--width", type=int, default=1920)
     ap.add_argument("--height", type=int, default=1080)
-    ap.add_argument("--paper", choices=["a4", "letter", "auto"], default="a4",
-                    help="scan aspect ratio (orientation is detected); auto = closest of a4/letter")
+    ap.add_argument("--paper", choices=["auto", "a4", "a4p", "a4l", "letter", "photo", "card"], default="auto",
+                    help="scan shape: auto = follow the detected document (default); "
+                         "a4/a4p = A4 portrait; a4l = A4 landscape; letter = US Letter; "
+                         "photo = 20x25 cm (4:5) portrait; card = 10x15 cm portrait")
     ap.add_argument("--scan-size", type=int, default=1100, help="long side of the scan in px")
     ap.add_argument("--doc-up", choices=["down", "up", "left", "right"], default="down",
                     help="where the top of the document points in the camera image "
@@ -304,6 +336,12 @@ def main(argv=None):
         if tracker.locked:
             tracker.toggle_mirror()
 
+    def set_format(fmt):
+        tracker.set_format(fmt)
+        if tracker.locked:
+            fit_scan_window()                    # window takes the new shape
+        print(f"format: {fmt}")
+
     def save():
         if state.get("scan") is not None:
             name = f"scan_{time.strftime('%Y%m%d_%H%M%S')}.png"
@@ -401,12 +439,32 @@ def main(argv=None):
                    debug=toggle_debug, voice=toggle_voice, export=export, enroll=enroll,
                    quit=lambda: state.update(quit=True))
     ui = UI(actions)
+    cmds = queue.Queue()
+    start_control_server(cmds)
     fit_scan_window()
     was_locked = False
+
+    def run_remote_commands():
+        """Run every queued remote command, one by one."""
+        while True:
+            try:
+                name = cmds.get_nowait()
+            except queue.Empty:
+                return
+            if name.startswith("format/"):
+                set_format(name.split("/", 1)[1])
+            elif name in actions:
+                actions[name]()
+            else:
+                print(f"remote command not implemented: {name}")
+            # let Tk apply the new window size before the next command reads it
+            # (matters when the dial sends 3 rotations in a row)
+            ui.update()
 
     fps, last = 0.0, time.perf_counter()
     try:
         while not state.get("quit") and not ui.closed:
+            run_remote_commands()
             ok, frame = cap.read()
             if not ok or frame is None:
                 if args.video:

@@ -27,6 +27,10 @@ _UNIT = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)  # TL TR BR BL
 
 _UNIT = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)  # TL TR BR BL
 
+# (width, height) in mm; only the ratio matters
+ALIASES = {"a4": "a4p"}                       # old --paper a4 still works
+PAPERS = {"a4p": (210, 297), "a4l": (297, 210), "photo": (200, 250), "card": (100, 150), "letter": (216, 279)}
+KNOWN_RATIOS = (297 / 210, 279 / 216, 250 / 200, 150 / 100)   # A4, Letter, photo, card
 
 @dataclass
 class Track:
@@ -65,7 +69,12 @@ class DocumentTracker:
         self.max_docs = max_docs
         self.min_score = min_score
         self.new_score = new_score
-        self.paper = paper
+        paper = ALIASES.get(paper, paper)
+        if paper != "auto" and paper not in PAPERS:
+            raise ValueError(f"unknown paper format {paper!r}")
+        self.format = paper                  # "auto" or a key of PAPERS
+        self._auto_ratio = 297 / 210         # measured when a document is locked
+        self._base_portrait = True           # is the un-rotated scan portrait?
         self.scan_long_side = scan_long_side
         self.match_iou = match_iou
         self.min_hits = min_hits
@@ -100,11 +109,51 @@ class DocumentTracker:
 
     @property
     def scan_size(self) -> Optional[Tuple[int, int]]:
-        """Default (w, h) of the scan: the paper size, swapped after a 90/270 deg rotation."""
+        """Default (w, h) of the scan for the current format and rotation."""
         if self._lock is None:
             return None
-        w, h = self._lock.scan_size
+        long_ = self.scan_long_side
+        short = max(16, int(round(long_ / self._ratio())))
+        w, h = (short, long_) if self._base_portrait else (long_, short)
         return (h, w) if self._quarter_turns % 2 else (w, h)
+
+    def _ratio(self) -> float:
+        """Long side / short side of the current format."""
+        if self.format == "auto":
+            return self._auto_ratio
+        w, h = PAPERS[self.format]
+        return max(w, h) / min(w, h)
+
+    def _portrait(self) -> bool:
+        return self._base_portrait != (self._quarter_turns % 2 == 1)
+
+    def set_format(self, fmt: str) -> None:
+        """'auto' follows the detected document; a4p / a4l / card / letter are fixed."""
+        fmt = ALIASES.get(fmt, fmt)
+        if fmt != "auto" and fmt not in PAPERS:
+            raise ValueError(f"unknown paper format {fmt!r}")
+        self.format = fmt
+        self._apply_format_orientation()
+
+    def _apply_format_orientation(self) -> None:
+        """Fixed formats set the scan shape (portrait / landscape) without turning the content."""
+        if self._lock is None or self.format == "auto":
+            return
+        w, h = PAPERS[self.format]
+        # choose the base shape so that the shown shape (after any Rotate presses) is portrait or landscape
+        self._base_portrait = (h > w) != (self._quarter_turns % 2 == 1)
+
+    def _measure(self, c: np.ndarray) -> None:
+        """Estimate the document's shape from its corners (TL TR BR BL)."""
+        w = (np.linalg.norm(c[1] - c[0]) + np.linalg.norm(c[2] - c[3])) / 2
+        h = (np.linalg.norm(c[3] - c[0]) + np.linalg.norm(c[2] - c[1])) / 2
+        self._base_portrait = bool(h >= w)
+        r = float(np.clip(max(w, h) / max(min(w, h), 1e-6), 1.0, 2.5))
+        for k in KNOWN_RATIOS:                    # snap only when very close
+            if abs(r - k) / k < 0.025:
+                r = k
+                break
+        self._auto_ratio = r
 
     def rotate(self, quarter_turns: int = 1) -> None:
         """Correct the document's orientation by 90 deg clockwise steps: the corner
@@ -140,7 +189,9 @@ class DocumentTracker:
                                        scan_long_side=self.scan_long_side)
         self._lock_track = Track(t.id, self._lock.corners.copy(), t.score, t.hits)
         self._reset_orientation()
-        self._tracks.clear()  # stop tracking everything else
+        self._measure(t.corners)               # freeze the document's shape (auto mode)
+        self._apply_format_orientation()       # fixed formats: force portrait / landscape
+        self._tracks.clear()
         return True
 
     def select_at(self, x: float, y: float) -> Optional[Track]:
