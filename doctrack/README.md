@@ -38,6 +38,10 @@ corner covered by a hand or pen (hollow circle) keeps its **last position**, and
 This works for 1, 2, 3 or all 4 corners. When uncovered, it is searched for starting at its last position and going
 outward. Outline: green = all corners seen, yellow = some covered, orange = all covered. The scan has a fixed size
 (A4 1:√2 by default). **`r` or right click** releases it.
+**Layout:** at start the teacher view (camera with tracking overlays) fills the left 2/3 of the screen and
+the student view (the scan) the right 1/3. With no document locked, the student view shows the usual dark
+placeholder, with live thumbnails of the recognised faces when faces are on; a locked page takes the largest paper-shaped window that
+fits the right third. `--display-width` overrides the teacher view's width.
 **Windows** are Tk (OpenCV's macOS windows can't report a user-resized size, and mixing them with Tk loses key
 presses). **Scan window:** freely
 resizable. The warp is recomputed every frame at the window's current size, so the scan always fills it and `s`
@@ -85,8 +89,10 @@ While it exports, a **progress popup** shows the page image it captured when you
 PDF background, also saved as `notes_<time>.png`; it has the scan window's current shape, at full
 resolution) and the current step (transcribing the last words, OCR, summary,
 writing the PDF) with a progress bar. When it's done, it shows where the file was saved and closes itself
-after 2 s (on an error it stays open). An **Export debug** window, terminal style, with the LLM's name on
-top, shows the OCR text, which comments were kept or dropped, and the summary as the model writes it. Pressing `p` again while an export is running does nothing.
+after 2 s (on an error it stays open). The export trace (OCR text, which comments were kept or dropped, and the summary as the LLM writes
+it, with the model's name) is printed in the terminal, no extra window. When the export is done, the PDF
+opens (`--no-open-pdf` to turn that off) and the teacher view shows a fading "PDF exported successfully".
+While recording, the teacher view shows a blinking REC badge with the elapsed time. Pressing `p` again while an export is running does nothing.
 The PDF is also copied to **`~/Downloads`** as `voice-notes_<date_time>_<time>.pdf` (`name (1).pdf` if the name is
 taken, like a browser download). Change it with `--download-dir <folder>`, or turn it off with `--download-dir ''`.
 Output goes to `voice_notes/<date_time>/`: `rec_NN/session.wav` and `rec_NN/transcript.json` for each recording,

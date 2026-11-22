@@ -50,7 +50,6 @@ class UI:
         self.scan.set_content_size(*scan_size)
 
         self._export: Optional["ExportPopup"] = None
-        self._export_debug: Optional["ExportDebugWindow"] = None
         self._debug_top: Optional[tk.Toplevel] = None
         self._debug_view = None
         self._debug_photo = None
@@ -96,15 +95,36 @@ class UI:
         if self._export is None or self._export.progress is not progress:   # a new export
             if self._export is not None:
                 self._export.close()
-            if self._export_debug is not None:
-                self._export_debug.close()
-            self._export_debug = ExportDebugWindow(self.root, progress.model)
             self._export = ExportPopup(self.root)
             self._export.progress = progress
-        if self._export_debug.alive:               # closed by the user: stays closed
-            self._export_debug.render(progress)
         if self._export.alive:
             self._export.render(progress)
+
+    # Screen layout: teacher view (camera + debug overlays) on the left, student view (the
+    # scan) on the right STUDENT_FRAC of the screen.
+    STUDENT_FRAC = 1 / 3
+    MENU_BAR, TITLE_BAR, GAP = 25, 28, 6      # macOS menu bar / window title bar, in px
+
+    def layout(self) -> None:
+        """Compute the two screen areas (x, y, w, h of the image area) and place the windows."""
+        self.root.update_idletasks()
+        W, H = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        sw = int(W * self.STUDENT_FRAC)
+        usable = H - self.MENU_BAR - self.TITLE_BAR - self.GAP
+        self.student_area = (W - sw, self.MENU_BAR, sw, usable - self.scan.bar_height())
+        self.teacher_area = (0, self.MENU_BAR, W - sw - self.GAP, usable)
+        self.root.geometry(f"+0+{self.MENU_BAR}")
+
+    def fit_student(self, shape: Optional[Tuple[int, int]] = None) -> None:
+        """Size + place the scan window in the student area: the whole area, or the largest
+        window of `shape` (w, h) aspect that fits, centred at the top of the area."""
+        x, y, aw, ah = self.student_area
+        if shape is None:
+            w, h = aw, ah
+        else:
+            k = min(aw / float(shape[0]), ah / float(shape[1]))
+            w, h = int(shape[0] * k), int(shape[1] * k)
+        self.scan.set_content_size(w, h, x + (aw - w) // 2, y)
 
     def update(self) -> None:
         if self.closed:
@@ -208,72 +228,6 @@ class ExportPopup:
             pass
 
 
-class ExportDebugWindow:
-    """Terminal-style log of the export: OCR text, kept / dropped comments, and the LLM's
-    answer streamed as it is written, under a header with the model's name and state."""
-
-    COLORS = {"header": "#58a6ff", "info": "#8b949e", "ocr": "#e6edf3", "keep": "#7ee787",
-              "drop": "#ff7b72", "llm": "#d2a8ff"}
-    STATE = {None: "starting", "wait": "waiting for the transcription", "ocr": "idle - OCR running",
-             "summary": "working - writing the summary", "pdf": "done"}
-
-    def __init__(self, root: tk.Tk, model: str) -> None:
-        self.top = tk.Toplevel(root)
-        self.model = model or "no LLM (--no-llm)"
-        self.top.title(f"Export debug - {self.model}")
-        self.top.configure(bg="#0d1117")
-        self.top.protocol("WM_DELETE_WINDOW", self.close)
-        self.top.geometry("640x560+40+60")
-        bar = tk.Frame(self.top, bg="#161b22", padx=12, pady=8)
-        bar.pack(side="top", fill="x")
-        tk.Label(bar, text=self.model, bg="#161b22", fg="#d2a8ff",
-                 font=("Menlo", 16, "bold")).pack(side="left")
-        self._state = tk.Label(bar, text="", bg="#161b22", fg="#8b949e", font=("Menlo", 12))
-        self._state.pack(side="right")
-        body = tk.Frame(self.top, bg="#0d1117")
-        body.pack(fill="both", expand=True)
-        scroll = tk.Scrollbar(body)
-        scroll.pack(side="right", fill="y")
-        self.text = tk.Text(body, bg="#0d1117", fg="#c9d1d9", font=("Menlo", 12), wrap="word",
-                            bd=0, padx=12, pady=10, highlightthickness=0, yscrollcommand=scroll.set)
-        self.text.pack(side="left", fill="both", expand=True)
-        scroll.configure(command=self.text.yview)
-        for tag, color in self.COLORS.items():
-            self.text.tag_configure(tag, foreground=color)
-        self.text.tag_configure("header", font=("Menlo", 12, "bold"))
-        self.text.configure(state="disabled")
-        self._n = 0
-        self._dots = 0
-        self.alive = True
-
-    def render(self, p) -> None:
-        if not self.alive:
-            return
-        state = "error" if p.error else "done" if p.done else self.STATE.get(p.current, p.current)
-        if p.current == "summary" and not (p.done or p.error):
-            self._dots = (self._dots + 1) % 24
-            state += "." * (1 + self._dots // 8)                # simple activity indicator
-        self._state.configure(text=state, fg="#7ee787" if p.done else "#ff7b72" if p.error else "#8b949e")
-        new = p.lines[self._n:]
-        if not new:
-            return
-        at_end = self.text.yview()[1] > 0.98
-        self.text.configure(state="normal")
-        for text, tag in new:
-            self.text.insert("end", text, tag)
-        self.text.configure(state="disabled")
-        self._n += len(new)
-        if at_end:
-            self.text.see("end")                                 # follow, unless you scrolled up
-
-    def close(self) -> None:
-        self.alive = False
-        try:
-            self.top.destroy()
-        except tk.TclError:
-            pass
-
-
 class ScanPane:
     """Scan window: toolbar + an image area that the scan is warped to fit exactly."""
 
@@ -298,10 +252,14 @@ class ScanPane:
         """Current (w, h) of the image area = the size to warp the scan to."""
         return max(self.view.winfo_width(), 16), max(self.view.winfo_height(), 16)
 
-    def set_content_size(self, w: int, h: int) -> None:
+    def bar_height(self) -> int:
         self.top.update_idletasks()
-        bar_h = max(self._bar.winfo_reqheight(), self._bar.winfo_height())
-        self.top.geometry(f"{int(w)}x{int(h) + bar_h}")
+        return max(self._bar.winfo_reqheight(), self._bar.winfo_height())
+
+    def set_content_size(self, w: int, h: int, x: Optional[int] = None, y: Optional[int] = None) -> None:
+        """Image area of w x h (the toolbar comes on top); moved to (x, y) if given."""
+        pos = f"+{int(x)}+{int(y)}" if x is not None and y is not None else ""
+        self.top.geometry(f"{int(w)}x{int(h) + self.bar_height()}{pos}")
 
     def set_state(self, enabled: bool, mirrored: bool) -> None:
         state = "normal" if enabled else "disabled"
