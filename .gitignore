@@ -224,3 +224,17 @@ __marimo__/
 
 # macOS
 .DS_Store
+
+# DocTrack outputs
+recordings/
+scan_*.png
+
+# C# / Loupedeck plugin (Visual Studio / Rider)
+bin/
+obj/
+.vs/
+*.user
+*.suo
+.idea/
+
+.vscode/
