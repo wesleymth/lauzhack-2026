@@ -114,8 +114,7 @@ class FaceRecognizer:
 def draw(frame: np.ndarray, faces: List[Face]) -> None:
     for f in faces:
         x, y, w, h = f.box
-        col = (0, 200, 0) if f.name != "unknown" else (0, 0, 220)
-        cv2.rectangle(frame, (x, y), (x + w, y + h), col, 2)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 0), 3)
         #cv2.putText(frame, f.name, (x, max(y - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
         
         
@@ -129,7 +128,7 @@ def draw_thumbs(vis: np.ndarray, frame: np.ndarray, faces: List[Face],
     if s < 16:
         return
     y = H - m
-    for f in [f for f in faces if f.name != "unknown"][:max_n]:
+    for f in faces[:max_n]:
         x0, y0, w, h = f.box
         half = max(w, h) // 2 + int(pad * max(w, h))
         cx, cy = x0 + w // 2, y0 + h // 2
