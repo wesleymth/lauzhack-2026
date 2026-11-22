@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 KEYS = {"r": "release", "o": "rotate", "m": "mirror", "s": "save", "d": "debug",
-        "v": "voice", "p": "export", "q": "quit", "Escape": "quit"}
+        "v": "voice", "p": "export", "q": "quit", "Escape": "quit", "f": "enroll",}
 BG = "#282828"
 
 
