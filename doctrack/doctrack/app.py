@@ -294,6 +294,9 @@ def main(argv=None):
                     help="scan shape: auto = follow the detected document (default); "
                          "a4/a4p = A4 portrait; a4l = A4 landscape; letter = US Letter; "
                          "photo = 20x25 cm (4:5) portrait; card = 10x15 cm portrait")
+    ap.add_argument("--lock-backend", default="auto",
+                    help="how a locked page is followed: auto (default), docaligner, vision, classic"
+                         " (and any backend added on the track/* branches)")
     ap.add_argument("--scan-size", type=int, default=1100, help="long side of the scan in px")
     ap.add_argument("--doc-up", choices=["down", "up", "left", "right"], default="down",
                     help="where the top of the document points in the camera image "
@@ -344,7 +347,8 @@ def main(argv=None):
     from .exposure import ExposureLock
     exposure = ExposureLock() if not args.video else None
     tracker = DocumentTracker(OpenCVDocumentDetector(DetectorConfig(doc_up=args.doc_up)), paper=args.paper,
-                              scan_long_side=args.scan_size)
+                              scan_long_side=args.scan_size, lock_backend=args.lock_backend)
+    print(f"locked-page tracking: {tracker.lock_backend}")
     state = {"scale": 1.0, "debug": False}
     hand_tracker, selector = None, None
     if not args.no_hands:
