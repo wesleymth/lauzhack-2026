@@ -181,11 +181,11 @@ class DocumentTracker:
         if self.lock_backend in ("vision", "docaligner"):
             if self._model is None:
                 self._model = DocAlignerModel() if self.lock_backend == "docaligner" else None
-            self._lock = VisionLockedTracker(self._last_frame, t.corners, self._last_t, paper=self.paper,
+            self._lock = VisionLockedTracker(self._last_frame, t.corners, self._last_t, paper="auto",
                                              scan_long_side=self.scan_long_side,
                                              occluders=self._last_occluders, detector=self._model)
         else:
-            self._lock = LockedTracker(self._last_frame, t.corners, self._last_t, paper=self.paper,
+            self._lock = LockedTracker(self._last_frame, t.corners, self._last_t, paper="auto",
                                        scan_long_side=self.scan_long_side)
         self._lock_track = Track(t.id, self._lock.corners.copy(), t.score, t.hits)
         self._reset_orientation()
