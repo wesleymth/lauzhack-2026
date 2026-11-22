@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 
 from .filters import OneEuroFilter
-from .geometry import estimate_aspect, paper_size, quad_area, quad_size, warp_document
+from .geometry import estimate_aspect, paper_size, quad_area, quad_size, refine_quad, warp_document
 
 TRACKING, PARTIAL, COVERED, SEARCHING = "tracking", "partial", "covered", "searching"
 
@@ -85,6 +85,7 @@ class VisionLockedTracker:
         H, W = frame.shape[:2]
         self._k = W / 1920.0                              # pixel scale relative to 1080p
         self.model = detector or VisionDocumentDetector()
+        self.edge_snap = True                             # snap model corners to the page edges
         self.min_conf = min_conf if min_conf is not None else self.model.min_conf
         self._proposer = None                             # page detector used to propose where to look
         corners = np.asarray(corners, np.float32)
@@ -251,6 +252,11 @@ class VisionLockedTracker:
         if q is None or conf < (getattr(self.model, "strict_conf", 0.9) if strict else self.min_conf):
             return None
         q = (q + np.float32([x0, y0])).astype(np.float32)
+        if self.edge_snap:
+            # the model is only accurate to a few px (256 px input): move each side onto
+            # the page's real edge nearby; sides without a clear edge (hand) stay put
+            q, _ = refine_quad(frame, q)
+            q = q.astype(np.float32)
         q = _align(self.raw, q)                           # keep the document's corner order
         if not cv2.isContourConvex(q.reshape(-1, 1, 2)):
             return None

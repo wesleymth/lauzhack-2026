@@ -58,7 +58,8 @@ class DocumentTracker:
                  lock_backend: str = "auto") -> None:
         """lock_backend: how a selected document is tracked. "flow" = follows the
         page's content (optical flow + homography, ORB re-matching; flow_track.py),
-        handing blank pages over to docaligner; "docaligner" =
+        handing blank pages over to docaligner, whose corners are snapped onto the
+        page's real edges; "docaligner" =
         pretrained DocAligner corner model (onnxruntime), "vision" = Apple's
         document detector (macOS), "classic" = the OpenCV tracker, "auto" =
         flow (this branch's default)."""
