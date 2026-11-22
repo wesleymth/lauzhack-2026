@@ -230,7 +230,7 @@ namespace Loupedeck.ExamplePlugin
     // Audio recording on/off. The icon shows the current state.
     public class AudioToggleCommand : PluginDynamicCommand
     {
-        private Boolean _on = true;   // assumed default; adjust once the Python side reports its state
+        private Boolean _on = false;  // not recording at start; adjust once the Python side reports its state
 
         public AudioToggleCommand()
             : base(displayName: "Audio on/off", description: "Turn audio recording on or off", groupName: "DocTrack")
