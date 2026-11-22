@@ -345,11 +345,11 @@ def main(argv=None):
             vis = draw(frame, tracker, fps, extra)
             if hands:
                 draw_hands(vis, hands, hand_tracker.connections, selector, now)
+            faces = []
             if face_rec is not None:
-                from .faces import draw as draw_faces, draw_thumbs
+                from .faces import draw as draw_faces
                 faces = face_rec.identify(frame)
                 draw_faces(vis, faces)
-                draw_thumbs(vis, frame, faces)     # crop from the raw frame, not from vis
             state["scale"] = min(1.0, args.display_width / float(vis.shape[1]))
             if state["scale"] < 1.0:
                 vis = cv2.resize(vis, None, fx=state["scale"], fy=state["scale"],
@@ -365,6 +365,10 @@ def main(argv=None):
             state["scan"] = scan
             if scan is not None and voice is not None:
                 scan = draw_notes(scan, voice.notes(), tracker.view_transform(), pointer_uv, voice.recording)
+            if scan is not None and face_rec is not None:
+                from .faces import draw_thumbs
+                scan = scan.copy()                 # keep state["scan"] clean: the s key saves it
+                draw_thumbs(scan, frame, faces, size=0.2)
             ui.scan.show(scan if scan is not None else placeholder(ww, wh))
             ui.scan.set_state(tracker.locked, tracker.mirrored)
 

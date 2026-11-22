@@ -62,13 +62,31 @@ class FaceRecognizer:
         f = self._rec.feature(self._rec.alignCrop(frame, row)).ravel()
         return f / (np.linalg.norm(f) + 1e-9)
 
+    def _nearest(self, box):
+        """Previous face at about the same place (same person, one frame earlier)."""
+        cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+        best, best_d = None, 0.6 * max(box[2], box[3])
+        for p in self._last:
+            d = np.hypot(p.box[0] + p.box[2] / 2 - cx, p.box[1] + p.box[3] / 2 - cy)
+            if d < best_d:
+                best, best_d = p, d
+        return best
+
     def identify(self, frame: np.ndarray) -> List[Face]:
-        """Runs every `every` frames; in between, returns the last result."""
+        """Boxes are tracked every frame; the (costlier) recognition runs every `every` frames,
+        or at once for a face that just appeared."""
         self._n += 1
-        if self._n % self.every != 1 and self.every > 1:
-            return self._last
+        refresh = self.every <= 1 or self._n % self.every == 1
         out = []
         for row in self._detect(frame):
+            box = np.array(row[:4], np.float32)
+            prev = self._nearest(tuple(box))
+            if prev is not None:                       # smooth the box so the thumbnail doesn't jitter
+                box = 0.6 * box + 0.4 * np.array(prev.box, np.float32)
+            box = tuple(int(v) for v in box)
+            if prev is not None and not refresh:
+                out.append(Face(box, prev.name, prev.score))
+                continue
             e = self._embed(frame, row)
             name, best = "unknown", -1.0
             for n, embs in self.db.items():
@@ -77,7 +95,7 @@ class FaceRecognizer:
                     best, name = s, n
             if best < self.threshold:
                 name = "unknown"
-            out.append(Face(tuple(int(v) for v in row[:4]), name, best))
+            out.append(Face(box, name, best))
         self._last = out
         return out
 
@@ -102,22 +120,25 @@ def draw(frame: np.ndarray, faces: List[Face]) -> None:
         
         
 def draw_thumbs(vis: np.ndarray, frame: np.ndarray, faces: List[Face],
-                size: float = 0.14, max_n: int = 3, pad: float = 0.25) -> None:
-    """Small live crop of each IDENTIFIED face, stacked up from the bottom-right corner.
-    `size` is the thumbnail side as a fraction of the frame width."""
-    H, W = vis.shape[:2]
-    s, m = int(size * W), 12
+                size: float = 0.2, max_n: int = 3, pad: float = 0.45, min_px: int = 140) -> None:
+    """Small live crop of each IDENTIFIED face, stacked up from the bottom-right corner of `vis`.
+    The crop is cut from `frame`, which may have a different size than `vis` (e.g. the scan)."""
+    fH, fW = frame.shape[:2]          # where the crop comes from
+    H, W = vis.shape[:2]              # where it is drawn
+    s, m = min(max(int(size * W), min_px), W - 2 * 12, H - 2 * 12), 12
+    if s < 16:
+        return
     y = H - m
     for f in [f for f in faces if f.name != "unknown"][:max_n]:
         x0, y0, w, h = f.box
         half = max(w, h) // 2 + int(pad * max(w, h))
         cx, cy = x0 + w // 2, y0 + h // 2
         xa, ya, xb, yb = cx - half, cy - half, cx + half, cy + half
-        crop = frame[max(ya, 0):min(yb, H), max(xa, 0):min(xb, W)]
+        crop = frame[max(ya, 0):min(yb, fH), max(xa, 0):min(xb, fW)]
         if crop.size == 0:
             continue
         # pad where the square leaves the frame, so the face is never stretched
-        crop = cv2.copyMakeBorder(crop, max(-ya, 0), max(yb - H, 0), max(-xa, 0), max(xb - W, 0),
+        crop = cv2.copyMakeBorder(crop, max(-ya, 0), max(yb - fH, 0), max(-xa, 0), max(xb - fW, 0),
                                   cv2.BORDER_CONSTANT, value=(40, 40, 40))
         thumb = cv2.resize(crop, (s, s), interpolation=cv2.INTER_AREA)
         y -= s
