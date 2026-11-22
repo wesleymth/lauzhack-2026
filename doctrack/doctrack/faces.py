@@ -116,7 +116,7 @@ def draw(frame: np.ndarray, faces: List[Face]) -> None:
         x, y, w, h = f.box
         col = (0, 200, 0) if f.name != "unknown" else (0, 0, 220)
         cv2.rectangle(frame, (x, y), (x + w, y + h), col, 2)
-        cv2.putText(frame, f.name, (x, max(y - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+        #cv2.putText(frame, f.name, (x, max(y - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
         
         
 def draw_thumbs(vis: np.ndarray, frame: np.ndarray, faces: List[Face],
@@ -146,9 +146,4 @@ def draw_thumbs(vis: np.ndarray, frame: np.ndarray, faces: List[Face],
             break
         x = W - m - s
         vis[y:y + s, x:x + s] = thumb
-        cv2.rectangle(vis, (x, y), (x + s, y + s), (0, 200, 0), 2)
-        band = vis[y + s - 26:y + s, x:x + s]
-        band[:] = (band * 0.4).astype(np.uint8)              # dark strip behind the name
-        cv2.putText(vis, f.name, (x + 6, y + s - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255, 255, 255), 2, cv2.LINE_AA)
         y -= m
