@@ -297,6 +297,8 @@ def main(argv=None):
     ap.add_argument("--lock-backend", default="auto",
                     help="how a locked page is followed: auto (default), docaligner, vision, classic"
                          " (and any backend added on the track/* branches)")
+    ap.add_argument("--no-sam", action="store_true",
+                    help="don't outline the locked page with MobileSAM (use the detector's corners)")
     ap.add_argument("--scan-size", type=int, default=1100, help="long side of the scan in px")
     ap.add_argument("--doc-up", choices=["down", "up", "left", "right"], default="down",
                     help="where the top of the document points in the camera image "
@@ -347,7 +349,8 @@ def main(argv=None):
     from .exposure import ExposureLock
     exposure = ExposureLock() if not args.video else None
     tracker = DocumentTracker(OpenCVDocumentDetector(DetectorConfig(doc_up=args.doc_up)), paper=args.paper,
-                              scan_long_side=args.scan_size, lock_backend=args.lock_backend)
+                              scan_long_side=args.scan_size, lock_backend=args.lock_backend,
+                              use_sam=not args.no_sam)
     print(f"locked-page tracking: {tracker.lock_backend}")
     state = {"scale": 1.0, "debug": False}
     hand_tracker, selector = None, None
