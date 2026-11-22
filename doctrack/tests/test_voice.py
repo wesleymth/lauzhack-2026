@@ -200,3 +200,14 @@ def test_words_before_any_finger_are_one_unpinned_comment():
 def test_no_finger_at_all_gives_one_unpinned_comment():
     notes = notes_from(said("A. B.", 1.0), [])
     assert [(n.text, n.uv) for n in notes] == [("A. B.", None)]
+
+
+def test_low_frame_rate_still_finds_stops():
+    """Regression: while recording the app may run at ~1.7 fps (samples 0.6 s apart). A fixed
+    0.5 s sample gap rejected every stop, so everything ended up in one unpinned comment."""
+    words = said("this is the logo.", 6.0) + said("these are the contacts.", 13.8)
+    samples = track((4.6, 10.3, (0.78, 0.26)), (13.3, 20.5, (0.68, 0.57)), fps=1.6)
+    notes = notes_from(words, samples)
+    assert [n.text for n in notes] == ["this is the logo.", "these are the contacts."]
+    assert notes[0].uv == pytest.approx((0.78, 0.26), abs=0.01)
+    assert notes[1].uv == pytest.approx((0.68, 0.57), abs=0.01)
