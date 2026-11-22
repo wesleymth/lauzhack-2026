@@ -55,11 +55,12 @@ class DocumentTracker:
     def __init__(self, detector, paper: str = "a4", scan_long_side: int = 1100,
                  max_docs: int = 3, min_hits: int = 10, min_score: float = 0.6,
                  new_score: float = 0.45, match_iou: float = 0.3, max_misses: int = 30,
-                 lock_backend: str = "auto") -> None:
+                 lock_backend: str = "auto", use_sam: bool = True) -> None:
         """lock_backend: how a selected document is tracked. "flow" = follows the
         page's content (optical flow + homography, ORB re-matching; flow_track.py),
         handing blank pages over to docaligner, whose corners are snapped onto the
-        page's real edges; "docaligner" =
+        page's real edges (the locked page is first outlined with MobileSAM,
+        sam_select.py, unless use_sam=False); "docaligner" =
         pretrained DocAligner corner model (onnxruntime), "vision" = Apple's
         document detector (macOS), "classic" = the OpenCV tracker, "auto" =
         flow (this branch's default)."""
@@ -69,6 +70,8 @@ class DocumentTracker:
         self.lock_backend = lock_backend
         self._last_occluders: List[np.ndarray] = []
         self._model = None                                # corner model, loaded on first lock
+        self.use_sam = use_sam                            # outline the locked page with MobileSAM
+        self._segmenter = None
         self.max_docs = max_docs
         self.min_score = min_score
         self.new_score = new_score
@@ -177,10 +180,31 @@ class DocumentTracker:
             self._lock_track.corners = self._lock.corners[self._perm].copy()
             self._lock_track.visible = self._lock.visible[self._perm].copy()
 
-    def select(self, track_id: int) -> bool:
+    def _sam_outline(self, point, near: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        """Page corners from MobileSAM (sam_select.py) for the page under `point`, or None.
+        With `near` (the browse detector's corners), the result must overlap them."""
+        if not self.use_sam:
+            return None
+        try:
+            if self._segmenter is None:
+                from .sam_select import PageSegmenter
+                self._segmenter = PageSegmenter()
+            q = self._segmenter.page_quad(self._last_frame, point)
+        except Exception as e:                              # model missing / download failed
+            print(f"sam: unavailable ({e}); using the detector's corners")
+            self.use_sam = False
+            return None
+        if q is None or (near is not None and quad_iou(q, near) < 0.6):
+            return None
+        return _align(near, q) if near is not None else q
+
+    def select(self, track_id: int, point=None) -> bool:
         t = self._tracks.get(track_id)
         if t is None or self._last_frame is None:
             return False
+        q = self._sam_outline(point if point is not None else t.corners.mean(0), near=t.corners)
+        if q is not None:                                   # precise outline from MobileSAM
+            t.corners = q
         if self.lock_backend == "flow":
             from .flow_track import FlowLockedTracker
             frame, corners, t0, occ = self._last_frame, t.corners, self._last_t, self._last_occluders
@@ -217,9 +241,16 @@ class DocumentTracker:
             return self._lock_track  # locked: clicks don't switch documents
         hits = [t for t in self.tracks if point_in_quad(t.corners, x, y)]  # shown docs only
         if not hits:
-            return None
+            # nothing detected here: ask MobileSAM whether there is a page under the point
+            q = self._sam_outline((x, y)) if self._last_frame is not None else None
+            if q is None:
+                return None
+            t = Track(self._next_id, q, 0.6)
+            self._next_id += 1
+            self._tracks[t.id] = t
+            return self._lock_track if self.select(t.id, point=None) else None
         t = min(hits, key=lambda t: quad_area(t.corners))  # innermost document wins
-        return self._lock_track if self.select(t.id) else None
+        return self._lock_track if self.select(t.id, point=(x, y)) else None
 
     def clear_selection(self) -> None:
         self._lock = None
