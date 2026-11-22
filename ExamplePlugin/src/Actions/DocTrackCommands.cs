@@ -22,44 +22,6 @@ namespace Loupedeck.ExamplePlugin
                 }
             });
         }
-
-        // True if something listens on the app's control port (the app is already up).
-        public static Boolean IsRunning()
-        {
-            try
-            {
-                using (var tcp = new System.Net.Sockets.TcpClient())
-                {
-                    return tcp.ConnectAsync("127.0.0.1", 8765).Wait(300) && tcp.Connected;
-                }
-            }
-            catch (Exception)
-            {
-                return false;
-            }
-        }
-
-        // doctrack/start.command: $DOCTRACK_DIR if set, else found by walking up from the plugin
-        // DLL (the dev build is linked from <repo>/ExamplePlugin/bin, so the repo is above it).
-        public static String FindStartScript()
-        {
-            var env = Environment.GetEnvironmentVariable("DOCTRACK_DIR");
-            if (!String.IsNullOrEmpty(env) && System.IO.File.Exists(System.IO.Path.Combine(env, "start.command")))
-            {
-                return System.IO.Path.Combine(env, "start.command");
-            }
-            var dir = System.IO.Path.GetDirectoryName(typeof(DocTrackClient).Assembly.Location);
-            while (!String.IsNullOrEmpty(dir))
-            {
-                var candidate = System.IO.Path.Combine(dir, "doctrack", "start.command");
-                if (System.IO.File.Exists(candidate))
-                {
-                    return candidate;
-                }
-                dir = System.IO.Path.GetDirectoryName(dir);
-            }
-            return null;
-        }
     }
 
     internal static class Icons
@@ -286,99 +248,17 @@ namespace Loupedeck.ExamplePlugin
             => Icons.Get(this._on ? "mic_on" : "mic_off", imageSize);
     }
 
-    // Start / Stop in one button.
-    // Not running: launches the Python app (doctrack/start.command) in a Terminal window;
-    // Terminal already has camera + microphone access and keeps the log visible (the plugin
-    // service itself has neither uv on its PATH nor those permissions).
-    // Running: asks it to quit (it closes the windows and releases the camera).
-    // The icon shows what a press will do, and follows the app even when it is started or
-    // quit some other way (checked every second).
-    public class StartStopCommand : PluginDynamicCommand
+    // Stop: asks the running Python app to quit (it closes the windows and releases the camera).
+    public class StopCommand : PluginDynamicCommand
     {
-        private static readonly TimeSpan BootTime = TimeSpan.FromSeconds(40);
-
-        private Boolean _running;
-        private DateTime _startingUntil = DateTime.MinValue;   // launched, control port not up yet
-        private readonly System.Threading.Timer _poll;
-
-        public StartStopCommand()
-            : base(displayName: "Start / Stop", description: "Start DocTrack, or stop it if it is running",
-                   groupName: "DocTrack")
+        public StopCommand()
+            : base(displayName: "Stop", description: "Stop DocTrack", groupName: "DocTrack")
         {
-            this._running = DocTrackClient.IsRunning();
-            this._poll = new System.Threading.Timer(_ => this.Refresh(), null, 1000, 1000);
         }
 
-        private Boolean Starting => !this._running && DateTime.UtcNow < this._startingUntil;
-
-        private void Refresh()
-        {
-            var running = DocTrackClient.IsRunning();
-            if (running)
-            {
-                this._startingUntil = DateTime.MinValue;
-            }
-            if (running != this._running)
-            {
-                this._running = running;
-                this.ActionImageChanged();
-            }
-        }
-
-        protected override void RunCommand(String actionParameter)
-        {
-            this._running = DocTrackClient.IsRunning();
-            if (this._running)
-            {
-                DocTrackClient.Send("quit");
-            }
-            else if (this.Starting)
-            {
-                PluginLog.Info("DocTrack is still starting");
-            }
-            else
-            {
-                this.Launch();
-            }
-            this.ActionImageChanged();
-        }
-
-        private void Launch()
-        {
-            var script = DocTrackClient.FindStartScript();
-            if (script == null)
-            {
-                PluginLog.Error("doctrack/start.command not found above the plugin folder; set DOCTRACK_DIR");
-                return;
-            }
-            try
-            {
-                var psi = new System.Diagnostics.ProcessStartInfo("open") { UseShellExecute = false };
-                psi.ArgumentList.Add("-a");
-                psi.ArgumentList.Add("Terminal");
-                psi.ArgumentList.Add(script);
-                System.Diagnostics.Process.Start(psi);
-                this._startingUntil = DateTime.UtcNow + BootTime;
-                PluginLog.Info($"Starting DocTrack: {script}");
-            }
-            catch (Exception ex)
-            {
-                PluginLog.Error(ex, "Could not start DocTrack");
-            }
-        }
+        protected override void RunCommand(String actionParameter) => DocTrackClient.Send("quit");
 
         protected override BitmapImage GetCommandImage(String actionParameter, PluginImageSize imageSize)
-        {
-            if (!this.Starting)
-            {
-                return Icons.Get(this._running ? "stop" : "start", imageSize);
-            }
-            using (var b = new BitmapBuilder(imageSize))   // booting: start icon with "..."
-            {
-                b.DrawImage(Icons.Get("start", imageSize), 0, 0, b.Width, b.Height);
-                b.DrawText("...", 0, b.Height - 30, b.Width, 28, new BitmapColor(64, 196, 255), 22);
-                return b.ToImage();
-            }
-        }
+            => Icons.Get("stop", imageSize);
     }
 }
