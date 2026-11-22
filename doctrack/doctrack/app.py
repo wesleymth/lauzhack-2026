@@ -111,22 +111,12 @@ def draw_hands(out, hands, connections, selector, t, pointer_hand=None, labels=F
         cv2.ellipse(out, c, (28, 28), -90, 0, 360 * selector.progress(t), (0, 255, 0), 6, cv2.LINE_AA)
 
 
-def draw_notes(scan, notes, view, pointer_uv, recording):
-    """Numbered pins for the notes so far, the live fingertip, and a REC badge (display only)."""
+def draw_notes(scan, view, pointer_uv, recording):
+    """Live scan window: the fingertip ring and a REC badge (display only). The notes
+    themselves are not drawn here: they only appear in the exported PDF."""
     from .voice import to_view
     out = scan.copy()
     h, w = out.shape[:2]
-    for n in notes:
-        if n.uv is None:
-            continue
-        u, v = to_view(n.uv, view)
-        c = (int(u * (w - 1)), int(v * (h - 1)))
-        cv2.circle(out, c, 13, (0, 200, 255), -1, cv2.LINE_AA)
-        cv2.circle(out, c, 13, (0, 0, 0), 2, cv2.LINE_AA)
-        label = str(n.index)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-        cv2.putText(out, label, (c[0] - tw // 2, c[1] + th // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (0, 0, 0), 2, cv2.LINE_AA)
     if pointer_uv is not None:
         u, v = to_view(pointer_uv, view)
         c = (int(u * (w - 1)), int(v * (h - 1)))
@@ -157,6 +147,14 @@ class ExportProgress:
         self.current, self.t_stage = None, self.t0
         self.done, self.error = False, None
         self.notes, self.summary = 0, False
+        self.snapshot = None                       # the page image frozen when p was pressed
+        self.captured_at = time.strftime("%H:%M:%S")
+        self.lines = []                            # debug transcript: (text, tag), append-only
+        self.model = ""
+
+    def log(self, text: str, tag: str = "info") -> None:
+        """Debug window text (called from the export thread; the UI reads it each frame)."""
+        self.lines.append((text, tag))
 
     def stage(self, name: str) -> None:
         self.current, self.t_stage = name, time.time()
@@ -228,6 +226,11 @@ def main(argv=None):
     ap.add_argument("--keep-hand-labels", action="store_true",
                     help="do NOT swap MediaPipe's Left/Right (as Hand_tracker --keep-labels)")
     ap.add_argument("--notes-dir", default="voice_notes", help="where recordings and PDFs go")
+    ap.add_argument("--anchor-radius", type=float, default=0.05,
+                    help="fingertip moves smaller than this (fraction of the page width) stay in "
+                         "the same comment")
+    ap.add_argument("--anchor-hold", type=float, default=0.4,
+                    help="seconds the fingertip must stay at a new spot to start a new comment there")
     ap.add_argument("--llm-model", default="qwen3:0.6b",
                     help="Ollama model for the summary. At export the page is OCR'd, note parts that "
                          "repeat it are removed, and this model writes a summary ('' = notes as spoken)")
@@ -268,7 +271,7 @@ def main(argv=None):
     if not args.no_voice:
         from .voice import VoiceNotes
         voice = VoiceNotes(Path(args.notes_dir), mic=args.mic, camera_mic=args.camera_mic,
-                           chunk_s=args.voice_chunk)
+                           chunk_s=args.voice_chunk, radius=args.anchor_radius, hold=args.anchor_hold)
         if hand_tracker is None:
             print("voice notes: no hand tracking, notes will not be pinned to a spot")
 
@@ -332,8 +335,16 @@ def main(argv=None):
         if running is not None and not (running.done or running.error):
             print("export: already running")
             return
-        scan = tracker.scan(frame)                     # full paper-size scan, current orientation
-        view = tracker.view_transform()
+        # Freeze the page NOW: the export runs for many seconds in the background while
+        # the camera keeps going; everything below uses only this copy.
+        frame = frame.copy()
+        # Same shape as the scan window right now (you may have resized it), at full
+        # resolution: the window's aspect ratio, long side = the paper scan's long side.
+        ww, wh = ui.scan.size()
+        long_side = max(tracker.scan_size)
+        k = long_side / float(max(ww, wh))
+        scan = tracker.scan(frame, size=(max(8, round(ww * k)), max(8, round(wh * k)))).copy()
+        view = tracker.view_transform().copy()
         voice.stop()
         if not voice.recordings:
             print("export: no voice notes yet (v to record)")
@@ -342,13 +353,18 @@ def main(argv=None):
         path = out_dir / f"notes_{time.strftime('%H-%M-%S')}.pdf"
 
         progress = ExportProgress(path)
+        progress.snapshot, progress.model = scan, args.llm_model
+        progress.log(f"EXPORT  -  page captured at {progress.captured_at} "
+                     f"({scan.shape[1]}x{scan.shape[0]} px)\n\n", "header")
         state["export"] = progress
 
         def run():
             from .voice import export_pdf
             try:
+                cv2.imwrite(str(path.with_suffix(".png")), scan)   # the exact page used for the PDF
                 if voice.busy:
                     progress.stage("wait")
+                    progress.log("waiting for the last transcription ...\n", "info")
                     print("export: waiting for transcription to finish ...", flush=True)
                 voice.wait()
                 notes = voice.notes()
@@ -358,10 +374,14 @@ def main(argv=None):
                         from .refine import refine_notes
                         summary, notes = refine_notes(scan, notes, view, model=args.llm_model,
                                                       url=args.ollama_url, log_path=path.with_suffix(".llm.json"),
-                                                      on_stage=progress.stage)
+                                                      on_stage=progress.stage, log=progress.log)
                     except Exception as e:  # OCR failed...: plain notes
                         print(f"refine: skipped ({type(e).__name__}: {e}); exporting the notes as spoken",
                               flush=True)
+                        progress.log(f"\nOCR failed ({type(e).__name__}: {e}): notes exported as spoken\n",
+                                     "drop")
+                else:
+                    progress.log("OCR and LLM off (--no-llm): notes exported as spoken\n", "info")
                 progress.stage("pdf")
                 export_pdf(scan, notes, path, view=view, paper=args.paper, summary=summary)
                 placed = sum(n.uv is not None for n in notes)
@@ -372,10 +392,12 @@ def main(argv=None):
                         print(f"saved to {progress.download}", flush=True)
                     except OSError as e:
                         print(f"could not copy the PDF to {args.download_dir}: {e}", flush=True)
+                progress.log(f"\nPDF written: {progress.download or path}\n", "header")
                 progress.notes, progress.summary = len(notes), bool(summary)
                 progress.done = True
             except Exception as e:  # shown in the popup instead of dying silently in the thread
                 progress.error = f"{type(e).__name__}: {e}"
+                progress.log(f"\nexport failed: {progress.error}\n", "drop")
                 print(f"export failed: {progress.error}", flush=True)
         threading.Thread(target=run, daemon=True).start()
 
@@ -408,6 +430,7 @@ def main(argv=None):
     try:
         while not state.get("quit") and not ui.closed:
             ok, frame = cap.read()
+            t_capture = time.time()                # fingertip samples are timed at capture
             if not ok or frame is None:
                 if args.video:
                     break
@@ -429,16 +452,17 @@ def main(argv=None):
 
             if tracker.locked and not was_locked and voice is not None:
                 voice.reset()                      # new document: new set of notes
+                voice.aspect = tracker.page_aspect
             pointer_uv, pointer_hand, pointer_status = None, None, ""
             if voice is not None and tracker.locked:
                 from .voice import pick_pointer
                 pointer_uv, pointer_hand, pointer_status = pick_pointer(
                     hands, tracker.to_doc, args.note_hand, args.note_any_pose)
-                voice.add_pointer(time.time(), pointer_uv, pointer_status)
+                voice.add_pointer(t_capture, pointer_uv, pointer_status)
 
             extra = ""
             if voice is not None and tracker.locked:
-                n = len(voice.notes())
+                n = len(voice.notes(max_age=0.5))   # status line only: refresh twice a second
                 extra = (" | REC (v stop)" if voice.recording else " | v record") + f" | {n} note(s), p export"
                 extra += " | finger: " + ("on page" if pointer_uv is not None else pointer_status)
             vis = draw(frame, tracker, fps, extra)
@@ -464,7 +488,7 @@ def main(argv=None):
             scan = tracker.scan(frame, size=(ww, wh))
             state["scan"] = scan
             if scan is not None and voice is not None:
-                scan = draw_notes(scan, voice.notes(), tracker.view_transform(), pointer_uv, voice.recording)
+                scan = draw_notes(scan, tracker.view_transform(), pointer_uv, voice.recording)
             if scan is not None and face_rec is not None:
                 from .faces import draw_thumbs
                 scan = scan.copy()                 # keep state["scan"] clean: the s key saves it

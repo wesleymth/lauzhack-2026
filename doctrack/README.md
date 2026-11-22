@@ -50,15 +50,18 @@ Keys work in every window: **Esc**/`q` quit, `r` release, `o` rotate, `m` mirror
 
 While a document is locked, press **`v`** to start recording, then talk and point at the page with your
 **right index finger** (pointing pose: index straight, other fingers curled, in any direction). Press **`v`**
-again to stop. Each spoken **sentence** starts a note, pinned where your fingertip was on the page when the
-sentence began (word timestamps from `../speech/stt.py`, faster-whisper `small.en`, run locally). A sentence
-spoken with no fingertip on the page goes into the **same comment as the last fingertip position**: the
-previous comment, or a new one at the spot you last pointed to if you pointed somewhere else in between.
+again to stop. Comments are anchored at the **word** level (word timestamps from `../speech/stt.py`,
+faster-whisper `small.en`, run locally; fingertip samples are timed at frame capture). A new comment starts
+at the first word spoken after your finger **stops at a new spot**: it moved more than 5% of the page width
+(`--anchor-radius`) and stayed there 0.4 s (`--anchor-hold`). Jitter and small moves stay in the same
+comment, and passing over the page on the way somewhere doesn't create one. Each comment is pinned at the
+median position of its stop. Words spoken with no fingertip on the page stay in the **same comment as the
+last fingertip position**. Words spoken before you first point form one comment without a pin.
 MediaPipe's Left/Right label is unreliable from above, so it only sets priority: if the right hand isn't
 pointing at the page, the other hand is used. While locked, each hand is labelled with why it's not pointing,
 the status line shows `finger: on page` or the reason, and stopping a recording prints how often the
-fingertip was found. The scan window shows a numbered pin per
-note, your live fingertip, and a REC badge. Press **`p`** to export the flattened scan as a PDF (A4/Letter
+fingertip was found. The scan window shows your live fingertip
+and a REC badge (the notes themselves only appear in the exported PDF). Press **`p`** to export the flattened scan as a PDF (A4/Letter
 page) with one **sticky-note comment** per sentence. These open in any PDF viewer's comments panel. If
 recording is still running, `p` stops it and waits for transcription to finish first. If the finger was never seen
 on the page, the text is exported in the top-left corner, marked "(no pointer)".
@@ -78,9 +81,12 @@ works, without a summary. Setup: `ollama pull qwen3:0.6b`. Options: `--llm-model
 spoken, no OCR), `--ollama-url`. The spoken text stays in the `.json` (`original`), and the OCR text and
 summary are saved in `notes_<time>.llm.json`.
 
-While it exports, a **progress popup** shows the current step (transcribing the last words, OCR, summary,
-writing the PDF) with a progress bar. When it's done, it shows where the file was saved, with **Open PDF** and
-**Show in Finder** buttons. Pressing `p` again while an export is running does nothing.
+While it exports, a **progress popup** shows the page image it captured when you pressed `p` (that exact image is the
+PDF background, also saved as `notes_<time>.png`; it has the scan window's current shape, at full
+resolution) and the current step (transcribing the last words, OCR, summary,
+writing the PDF) with a progress bar. When it's done, it shows where the file was saved and closes itself
+after 2 s (on an error it stays open). An **Export debug** window, terminal style, with the LLM's name on
+top, shows the OCR text, which comments were kept or dropped, and the summary as the model writes it. Pressing `p` again while an export is running does nothing.
 The PDF is also copied to **`~/Downloads`** as `voice-notes_<date_time>_<time>.pdf` (`name (1).pdf` if the name is
 taken, like a browser download). Change it with `--download-dir <folder>`, or turn it off with `--download-dir ''`.
 Output goes to `voice_notes/<date_time>/`: `rec_NN/session.wav` and `rec_NN/transcript.json` for each recording,

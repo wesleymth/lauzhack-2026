@@ -181,6 +181,14 @@ class DocumentTracker:
         u, v = p[0] / p[2], p[1] / p[2]
         return (float(u), float(v)) if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0 else None
 
+    @property
+    def page_aspect(self) -> float:
+        """Height / width of the locked page in the lock-time frame (the to_doc coords)."""
+        if self._lock is None:
+            return 2 ** 0.5
+        w, h = self._lock.scan_size
+        return h / float(w)
+
     def view_transform(self) -> np.ndarray:
         """3x3 map from lock-time doc coords (to_doc) to the scan's current orientation:
         (u, v) there times the scan size is the pixel in `scan()`."""

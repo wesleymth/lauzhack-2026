@@ -19,6 +19,7 @@ Output: voice_notes/<date_time>/
     notes_<time>.pdf, notes_<time>.json           one pair per export
 """
 
+import bisect
 import io
 from collections import Counter
 import json
@@ -27,7 +28,7 @@ import sys
 import threading
 import time
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Sequence, Tuple
@@ -64,24 +65,6 @@ class PointerLog:
         if self._file:
             self._file.write(json.dumps({"t": round(t, 3), "u": round(u, 4), "v": round(v, 4)}) + "\n")
 
-    def at(self, start: float, end: float, before: float = 1.0,
-           after: float = 0.5) -> Optional[Tuple[float, float]]:
-        """Where the finger was when a sentence spoken in [start, end] began: the sample
-        closest to `start`, looking from `before` s earlier to `after` s past the end."""
-        if not self.t:
-            return None
-        t = np.asarray(self.t)
-        ok = (t >= start - before) & (t <= end + after)
-        if not ok.any():
-            return None
-        i = np.flatnonzero(ok)[np.argmin(np.abs(t[ok] - start))]
-        return self.uv[i]
-
-    def last_before(self, t0: float) -> Optional[Tuple[float, Tuple[float, float]]]:
-        """(time, uv) of the last sample at or before t0, or None."""
-        i = int(np.searchsorted(np.asarray(self.t), t0, side="right")) - 1
-        return (self.t[i], self.uv[i]) if i >= 0 else None
-
     def close(self) -> None:
         if self._file:
             self._file.close()
@@ -109,6 +92,54 @@ def pick_pointer(hands, to_doc, hand: str = "Right", any_pose: bool = False):
         else:
             return uv, h, "ok"
     return None, None, reasons[0]
+
+
+@dataclass
+class Fixation:
+    """A place the fingertip stayed: from t0 on (until the next fixation), centred on `uv`."""
+    t0: float
+    uv: Tuple[float, float]
+    n: int                                   # samples in it
+
+
+def find_fixations(t: Sequence[float], uv: Sequence[Tuple[float, float]], radius: float = 0.05,
+                   hold: float = 0.4, aspect: float = 2 ** 0.5, max_gap: float = 0.5) -> List[Fixation]:
+    """Where the finger stopped, in time order.
+
+    A new fixation starts only when the fingertip moves more than `radius` (fraction of the
+    page width) away from the current one AND stays within `radius` of its new spot for `hold`
+    seconds (samples at most `max_gap` apart). Jitter and small moves stay in the current
+    fixation; passing over the page on the way somewhere doesn't create one. A fixation's
+    start is when the finger ARRIVED at the spot, not when the hold was confirmed. `aspect` =
+    page height / width, so distances are physical. The centre is the median of its samples.
+    """
+    def far(a, b):
+        return ((a[0] - b[0]) ** 2 + ((a[1] - b[1]) * aspect) ** 2) > radius ** 2
+
+    fixations, members = [], []            # members[i]: samples of fixations[i]
+    cur_mean = None                         # running mean of the current fixation
+    cand, cand_last = [], None              # samples of a possible new fixation
+    for ti, p in sorted(zip(t, uv), key=lambda s: s[0]):
+        if cur_mean is not None and not far(p, cur_mean):
+            members[-1].append(p)
+            k = len(members[-1])
+            cur_mean = (cur_mean[0] + (p[0] - cur_mean[0]) / k, cur_mean[1] + (p[1] - cur_mean[1]) / k)
+            cand = []
+            continue
+        if not cand or far(p, cand[0][1]) or ti - cand_last > max_gap:
+            cand = [(ti, p)]                 # (re)start a candidate at this spot
+        else:
+            cand.append((ti, p))
+        cand_last = ti
+        if ti - cand[0][0] >= hold:          # stayed long enough: it's a real stop
+            pts = [q for _, q in cand]
+            fixations.append(Fixation(cand[0][0], pts[0], len(pts)))
+            members.append(pts)
+            cur_mean = tuple(np.mean(pts, axis=0))
+            cand = []
+    for f, pts in zip(fixations, members):
+        f.uv, f.n = tuple(float(x) for x in np.median(pts, axis=0)), len(pts)
+    return fixations
 
 
 @dataclass
@@ -248,12 +279,13 @@ class Recording:
             self.transcript.add_words([], final=True)
         self.done.set()
 
-    def sentences(self) -> List[Tuple[float, float, str]]:
-        """(start epoch, end epoch, text) of the sentences transcribed so far."""
+    def words(self) -> List[Tuple[float, str]]:
+        """(start epoch, word) of every word transcribed so far, in order (word timestamps
+        from faster-whisper; the word keeps its punctuation)."""
         t0 = self.transcript.session_start_epoch
         if t0 is None:
             return []
-        return [(t0 + s["start"], t0 + s["end"], s["text"]) for s in list(self.transcript.sentences)]
+        return [(t0 + w["time"], w["word"]) for s in list(self.transcript.sentences) for w in s["words"]]
 
 
 # --------------------------------------------------------------------------- #
@@ -262,8 +294,12 @@ class Recording:
 
 class VoiceNotes:
     def __init__(self, out_root: Path, mic: Optional[str] = None, camera_mic: bool = False,
-                 chunk_s: float = 10.0) -> None:
+                 chunk_s: float = 10.0, radius: float = 0.05, hold: float = 0.4,
+                 lead: float = 0.3) -> None:
         self.out_root = Path(out_root)
+        self.radius, self.hold, self.lead = radius, hold, lead   # see notes()
+        self.aspect = 2 ** 0.5               # page height / width (lock frame), set by the app
+        self._cache = (None, 0.0, [])
         self._mic = SimpleNamespace(device=mic, camera=camera_mic)
         self._chunk_s = chunk_s
         self._model = _Model()
@@ -354,26 +390,41 @@ class VoiceNotes:
                 return False
         return True
 
-    def notes(self, after: float = 0.5) -> List[Note]:
-        """Comments, in speaking order. A sentence starts a new comment where the fingertip was
-        when it began (PointerLog.at). If the finger wasn't on the page then:
-        * finger not seen since the previous comment -> appended to that comment;
-        * finger seen since (e.g. pointed, then lifted before talking) -> new comment at the
-          last fingertip position."""
+    def fixations(self) -> List[Fixation]:
+        return find_fixations(self.pointer.t, self.pointer.uv, self.radius, self.hold, self.aspect)
+
+    def notes(self, max_age: float = 0.0) -> List[Note]:
+        """Comments, anchored at WORD level.
+
+        Every word is given to the finger stop (find_fixations) active when it was spoken: the
+        last stop that began before the word (or up to `lead` s after it, since you often start
+        talking just before the finger settles). Consecutive words on the same stop form one
+        comment, so a new comment starts exactly at the first word spoken at a new spot, and
+        small finger moves (< radius) never split a comment. Words with no fingertip on the
+        page stay with the last stop (the same comment as the last tracking point). Words before
+        any stop form an unpinned comment. `max_age` > 0 reuses a result up to that old (the
+        live status line calls this every frame)."""
+        key = (len(self.pointer.t), sum(len(r.transcript.sentences) for r in self.recordings),
+               self.radius, self.hold, self.aspect)
+        cached_key, cached_t, cached = self._cache
+        if key == cached_key or (max_age and time.time() - cached_t < max_age):
+            return [replace(n) for n in cached]
+        fixations = self.fixations()
+        starts = [f.t0 - self.lead for f in fixations]
+        words = sorted(w for rec in self.recordings for w in rec.words())
         out: List[Note] = []
-        for rec in self.recordings:
-            for start, end, text in rec.sentences():
-                uv = self.pointer.at(start, end)
-                if uv is None:
-                    last = self.pointer.last_before(start)
-                    prev = out[-1] if out else None
-                    if prev is not None and (last is None or last[0] <= prev.end + after):
-                        prev.text += " " + text
-                        prev.end = end
-                        continue
-                    uv = last[1] if last else None
-                out.append(Note(len(out) + 1, text, start, end, uv))
-        return out
+        current = object()                   # fixation index of the open comment
+        for tw, word in words:
+            i = bisect.bisect_right(starts, tw) - 1          # -1: before any stop
+            if out and i == current:
+                out[-1].text += " " + word
+                out[-1].end = tw
+            else:
+                uv = fixations[i].uv if i >= 0 else None
+                out.append(Note(len(out) + 1, word, tw, tw, uv))
+                current = i
+        self._cache = (key, time.time(), out)
+        return [replace(n) for n in out]
 
 
 # --------------------------------------------------------------------------- #
