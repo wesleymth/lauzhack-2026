@@ -5,11 +5,11 @@
     uv run python -m doctrack.app --video desk.mp4
 
 Select a document by POINTING at it with your index finger for 1 s (hand
-tracking, ../Hand_tracker), or with a left click. Right click releases.
+tracking, ../Hand_tracker), or with a left click. Right click or r releases.
 While locked, only that document is tracked and it is never dropped.
-Scan window: freely resizable, its size IS the warp size. Toolbar buttons (or
-keys) to fix the document orientation: Rotate 90 (o), Mirror left-right (m).
-Keys: q/Esc quit, r release, d toggle debug masks, s save scan PNG.
+Scan window: freely resizable; the warp is recomputed at the window's size, so
+the scan always fills it. Buttons (or keys): Rotate 90 (o), Mirror (m).
+Keys (any window): Esc/q quit, r release, o rotate, m mirror, s save scan PNG, d debug.
 """
 
 import argparse
@@ -21,11 +21,9 @@ import cv2
 import numpy as np
 
 from .detector import DetectorConfig, OpenCVDocumentDetector
+from .ui import UI
 from .tracker import DocumentTracker
 
-CAM_WIN = "doctrack - camera"
-SCAN_WIN = "doctrack - scan"
-DEBUG_WIN = "doctrack - debug"
 CORNER_COLORS = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)]  # doc TL TR BR BL (BGR)
 CORNER_NAMES = ["TL", "TR", "BR", "BL"]
 STATE_COLORS = {"tracking": (0, 255, 0), "partial": (0, 220, 255), "searching": (0, 120, 255)}
@@ -98,32 +96,6 @@ def draw_hands(out, hands, connections, selector, t):
         cv2.ellipse(out, c, (28, 28), -90, 0, 360 * selector.progress(t), (0, 255, 0), 6, cv2.LINE_AA)
 
 
-TOOLBAR_H = 44
-BUTTONS = [("rotate", "Rotate 90", 8, 138), ("mirror", "Mirror", 146, 256)]  # (id, label, x0, x1)
-
-
-def toolbar(width, tracker):
-    bar = np.full((TOOLBAR_H, width, 3), 50, np.uint8)
-    enabled = tracker.locked
-    for bid, label, x0, x1 in BUTTONS:
-        active = bid == "mirror" and tracker.mirrored
-        fill = (90, 140, 60) if active else ((95, 95, 95) if enabled else (65, 65, 65))
-        cv2.rectangle(bar, (x0, 6), (x1, TOOLBAR_H - 7), fill, -1)
-        cv2.rectangle(bar, (x0, 6), (x1, TOOLBAR_H - 7), (150, 150, 150), 1)
-        cv2.putText(bar, label, (x0 + 12, TOOLBAR_H - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                    (255, 255, 255) if enabled else (130, 130, 130), 1, cv2.LINE_AA)
-    return bar
-
-
-def scan_window_size(default):
-    """Current content size (w, h) of the scan window; the user can resize it freely."""
-    try:
-        _, _, w, h = cv2.getWindowImageRect(SCAN_WIN)
-    except cv2.error:
-        return default
-    return (w, h) if w > 50 and h > TOOLBAR_H + 50 else default
-
-
 def placeholder(w, h, text="point at / click a document"):
     img = np.full((h, w, 3), 40, np.uint8)
     cv2.putText(img, text, (20, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
@@ -166,57 +138,61 @@ def main(argv=None):
         except Exception as e:  # mediapipe / model missing: fall back to clicking
             print(f"hand tracking unavailable ({e}); click to select")
 
-    def on_mouse(event, x, y, _flags, _param):
-        fx, fy = x / state["scale"], y / state["scale"]
-        if event == cv2.EVENT_LBUTTONDOWN and not tracker.locked:
-            t = tracker.select_at(fx, fy)
-            if t:
-                print(f"locked #{t.id}, scan {tracker.scan_size[0]}x{tracker.scan_size[1]}")
-            else:
-                print("no document there")
-        elif event == cv2.EVENT_RBUTTONDOWN:
+    def click(x, y):
+        if tracker.locked:
+            return
+        t = tracker.select_at(x / state["scale"], y / state["scale"])
+        if t:
+            print(f"locked #{t.id}, scan {tracker.scan_size[0]}x{tracker.scan_size[1]}")
+        else:
+            print("no document there")
+
+    def release():
+        if tracker.locked:
             tracker.clear_selection()
+            print("released")
 
     def fit_scan_window():
-        """Size the scan window to the paper shape at --scan-display-height."""
+        """Start a newly locked document at its paper shape, --scan-display-height tall."""
         w, h = tracker.scan_size or (int(args.scan_display_height / 2 ** 0.5), args.scan_display_height)
         k = args.scan_display_height / float(h)
-        state["scan_win"] = (int(w * k), int(h * k) + TOOLBAR_H)
-        cv2.resizeWindow(SCAN_WIN, *state["scan_win"])
+        ui.scan.set_content_size(int(w * k), int(h * k))
 
     def rotate():
         if tracker.locked:
-            w, h = scan_window_size(state["scan_win"])
+            w, h = ui.scan.size()
             tracker.rotate(1)
-            state["scan_win"] = (h - TOOLBAR_H, w + TOOLBAR_H)   # content turns 90 deg
-            cv2.resizeWindow(SCAN_WIN, *state["scan_win"])
+            ui.scan.set_content_size(h, w)       # content turns 90 deg: swap the window shape
 
     def mirror():
         if tracker.locked:
             tracker.toggle_mirror()
 
-    def on_scan_mouse(event, x, y, _flags, _param):
-        if event != cv2.EVENT_LBUTTONDOWN or y >= TOOLBAR_H:
-            return
-        for bid, _label, x0, x1 in BUTTONS:
-            if x0 <= x <= x1:
-                rotate() if bid == "rotate" else mirror()
+    def save():
+        if state.get("scan") is not None:
+            name = f"scan_{time.strftime('%Y%m%d_%H%M%S')}.png"
+            cv2.imwrite(name, state["scan"])
+            print(f"saved {name} ({state['scan'].shape[1]}x{state['scan'].shape[0]})")
 
-    cv2.namedWindow(CAM_WIN, cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow(SCAN_WIN, cv2.WINDOW_NORMAL)   # freely resizable: its size is the warp size
+    def toggle_debug():
+        state["debug"] = not state["debug"]
+        if not state["debug"]:
+            ui.show_debug(None)
+
+    actions = dict(click=click, release=release, rotate=rotate, mirror=mirror, save=save,
+                   debug=toggle_debug, quit=lambda: state.update(quit=True))
+    ui = UI(actions)
     fit_scan_window()
-    cv2.setMouseCallback(CAM_WIN, on_mouse)
-    cv2.setMouseCallback(SCAN_WIN, on_scan_mouse)
     was_locked = False
 
     fps, last = 0.0, time.perf_counter()
-    scan = None
     try:
-        while True:
+        while not state.get("quit") and not ui.closed:
             ok, frame = cap.read()
             if not ok or frame is None:
                 if args.video:
                     break
+                ui.update()
                 continue
             now = time.perf_counter()
             hands = []
@@ -237,44 +213,28 @@ def main(argv=None):
             if state["scale"] < 1.0:
                 vis = cv2.resize(vis, None, fx=state["scale"], fy=state["scale"],
                                  interpolation=cv2.INTER_AREA)
-            cv2.imshow(CAM_WIN, vis)
+            ui.show_camera(vis)
 
             if tracker.locked and not was_locked:
                 fit_scan_window()                  # new document: start at its paper shape
             was_locked = tracker.locked
-            ww, wh = scan_window_size(state["scan_win"])
-            state["scan_win"] = (ww, wh)
-            scan = tracker.scan(frame, size=(ww, wh - TOOLBAR_H))
-            body = scan if scan is not None else placeholder(ww, wh - TOOLBAR_H)
-            cv2.imshow(SCAN_WIN, np.vstack([toolbar(ww, tracker), body]))
+            # the warp is recomputed at the window's current size: it always fills the window
+            ww, wh = ui.scan.size()
+            scan = tracker.scan(frame, size=(ww, wh))
+            state["scan"] = scan
+            ui.scan.show(scan if scan is not None else placeholder(ww, wh))
+            ui.scan.set_state(tracker.locked, tracker.mirrored)
 
             if state["debug"] and tracker.detector.debug:
-                cv2.imshow(DEBUG_WIN, np.hstack(list(tracker.detector.debug.values())))
-
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
-            if key == ord("r"):
-                tracker.clear_selection()
-            elif key == ord("o"):
-                rotate()
-            elif key == ord("m"):
-                mirror()
-            elif key == ord("d"):
-                state["debug"] = not state["debug"]
-                if not state["debug"]:
-                    cv2.destroyWindow(DEBUG_WIN)
-            elif key == ord("s") and scan is not None:
-                name = f"scan_{time.strftime('%Y%m%d_%H%M%S')}.png"
-                cv2.imwrite(name, scan)
-                print(f"saved {name} ({scan.shape[1]}x{scan.shape[0]})")
+                ui.show_debug(np.hstack(list(tracker.detector.debug.values())))
+            ui.update()                            # handles clicks, buttons and keys
     except KeyboardInterrupt:
         pass
     finally:
         cap.release()
         if hand_tracker is not None:
             hand_tracker.close()
-        cv2.destroyAllWindows()
+        ui.close()
 
 
 if __name__ == "__main__":

@@ -31,10 +31,13 @@ corner covered by a hand or pen (hollow circle) keeps its **last position**, and
 This works for 1, 2, 3 or all 4 corners. When uncovered, it is searched for starting at its last position and going
 outward. Outline: green = all corners seen, yellow = some covered, orange = all covered. The scan has a fixed size
 (A4 1:√2 by default). **`r` or right click** releases it.
-**Scan window:** freely resizable. Its size *is* the warp size (what you see is what `s` saves), and it opens
-at the paper shape. Toolbar: **Rotate 90** (`o`) turns the document's orientation clockwise. **Mirror** (`m`)
-flips it left-right. Both relabel the corners, so `tr.selected.corners` stays consistent with the scan.
-Keys: `q`/Esc quit, `d` debug masks, `s` save scan PNG.
+**Windows** are Tk (OpenCV's macOS windows can't report a user-resized size, and mixing them with Tk loses key
+presses). **Scan window:** freely
+resizable. The warp is recomputed every frame at the window's current size, so the scan always fills it and `s`
+saves exactly that. It opens at the paper shape (A4) when a document is locked. Buttons: **Rotate 90°** (`o`)
+turns the document's orientation clockwise and swaps the window shape. **Mirror** (`m`) flips left-right. Both
+relabel the corners, so `tr.selected.corners` stays consistent with the scan.
+Keys work in every window: **Esc**/`q` quit, `r` release, `o` rotate, `m` mirror, `s` save scan PNG, `d` debug masks.
 
 ## Library use (for another frontend)
 
