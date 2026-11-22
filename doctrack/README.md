@@ -42,13 +42,19 @@ Keys work in every window: **Esc**/`q` quit, `r` release, `o` rotate, `m` mirror
 ## Voice notes → commented PDF
 
 While a document is locked, press **`v`** to start recording, then talk and point at the page with your
-**right index finger** (pointing pose, as for selecting). Press **`v`** again to stop. Each spoken **sentence**
-becomes one note. It is pinned where your fingertip was on the page when the sentence began (word timestamps
-from `../speech/stt.py`, faster-whisper `small.en`, run locally). The scan window shows a numbered pin per
+**right index finger** (pointing pose: index straight, other fingers curled, in any direction). Press **`v`**
+again to stop. Each spoken **sentence** starts a note, pinned where your fingertip was on the page when the
+sentence began (word timestamps from `../speech/stt.py`, faster-whisper `small.en`, run locally). A sentence
+spoken with no fingertip on the page goes into the **same comment as the last fingertip position**: the
+previous comment, or a new one at the spot you last pointed to if you pointed somewhere else in between.
+MediaPipe's Left/Right label is unreliable from above, so it only sets priority: if the right hand isn't
+pointing at the page, the other hand is used. While locked, each hand is labelled with why it's not pointing,
+the status line shows `finger: on page` or the reason, and stopping a recording prints how often the
+fingertip was found. The scan window shows a numbered pin per
 note, your live fingertip, and a REC badge. Press **`p`** to export the flattened scan as a PDF (A4/Letter
 page) with one **sticky-note comment** per sentence. These open in any PDF viewer's comments panel. If
-recording is still running, `p` stops it and waits for transcription to finish first. A sentence spoken
-while your finger was off the page is still exported, stacked in the top-left corner and marked "(no pointer)".
+recording is still running, `p` stops it and waits for transcription to finish first. If the finger was never seen
+on the page, the text is exported in the top-left corner, marked "(no pointer)".
 
 ```bash
 uv run python -m doctrack.app                 # v / p work out of the box (system default mic)
@@ -60,7 +66,7 @@ Output goes to `voice_notes/<date_time>/`: `rec_NN/session.wav` and `rec_NN/tran
 `pointer.jsonl` with fingertip samples, and `notes_<time>.pdf` with a `.json` alongside (note text + u, v
 on the page). Positions are kept in document coordinates, so rotating or mirroring the scan before
 exporting still puts the notes in the right place. Notes are kept after a release and cleared when a
-new document is locked. Options: `--note-hand Left`, `--keep-hand-labels` (don't swap MediaPipe's
+new document is locked. Options: `--note-hand Left|any`, `--note-any-pose` (any index fingertip on the page counts), `--keep-hand-labels` (don't swap MediaPipe's
 Left/Right, like Hand_tracker), `--no-voice`. On macOS, allow microphone access for your terminal.
 
 ## Library use (for another frontend)

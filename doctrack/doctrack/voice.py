@@ -3,7 +3,9 @@
 While a document is locked, `v` starts/stops recording. Speech is transcribed
 locally with the team's speech-to-text (../speech/stt.py: faster-whisper, word
 timestamps). Each SENTENCE becomes one note, pinned where the right index
-finger pointed (pointing pose) on the page when the sentence began. `p` exports
+finger pointed (pointing pose, any direction) on the page when the sentence
+began. A sentence spoken with no fingertip on the page joins the comment of the
+last fingertip position (VoiceNotes.notes). `p` exports
 the flattened scan as a PDF with one sticky-note comment per sentence.
 
 Pointer positions are stored in normalised document coordinates (u, v in
@@ -18,6 +20,7 @@ Output: voice_notes/<date_time>/
 """
 
 import io
+from collections import Counter
 import json
 import queue
 import sys
@@ -53,7 +56,7 @@ class PointerLog:
     def __init__(self, path: Optional[Path] = None) -> None:
         self.t = []
         self.uv = []
-        self._file = open(path, "a") if path else None
+        self._file = open(path, "a", buffering=1) if path else None   # line-buffered
 
     def add(self, t: float, u: float, v: float) -> None:
         self.t.append(t)
@@ -74,10 +77,38 @@ class PointerLog:
         i = np.flatnonzero(ok)[np.argmin(np.abs(t[ok] - start))]
         return self.uv[i]
 
+    def last_before(self, t0: float) -> Optional[Tuple[float, Tuple[float, float]]]:
+        """(time, uv) of the last sample at or before t0, or None."""
+        i = int(np.searchsorted(np.asarray(self.t), t0, side="right")) - 1
+        return (self.t[i], self.uv[i]) if i >= 0 else None
+
     def close(self) -> None:
         if self._file:
             self._file.close()
             self._file = None
+
+
+def pick_pointer(hands, to_doc, hand: str = "Right", any_pose: bool = False):
+    """Which fingertip places the notes this frame: (uv, hand, status).
+
+    Hands labelled `hand` are tried first, then the others: MediaPipe's Left/Right
+    guess is unreliable from a top-down desk camera, so the label only sets priority.
+    The pointing pose is required (unless `any_pose`) but NOT its direction: you point
+    at a spot from wherever your hand is. `status` says why nothing was picked.
+    """
+    if not hands:
+        return None, None, "no hand seen"
+    ordered = sorted(hands, key=lambda h: hand != "any" and h.handedness != hand)
+    reasons = []
+    for h in ordered:
+        uv = to_doc(*h.tip)
+        if uv is None:
+            reasons.append("fingertip off the page")
+        elif not any_pose and not h.pointing_any_dir:
+            reasons.append(h.reason_any_dir or "not pointing")
+        else:
+            return uv, h, "ok"
+    return None, None, reasons[0]
 
 
 @dataclass
@@ -238,6 +269,8 @@ class VoiceNotes:
         self.session_dir: Optional[Path] = None
         self.pointer = PointerLog()
         self.recordings: List[Recording] = []
+        self.misses: Counter = Counter()      # why no fingertip was taken, per frame
+        self.frames = 0
 
     @property
     def recording(self) -> bool:
@@ -275,12 +308,22 @@ class VoiceNotes:
                         self._device, self._model, self._chunk_s)
         rec.start()
         self.recordings.append(rec)
+        self.misses, self.frames = Counter(), 0
         print("voice: recording (v to stop) - point at the page while you talk", flush=True)
 
     def stop(self) -> None:
         if self.recording:
             self.recordings[-1].stop()
             print("voice: stopped, transcribing the last part ...", flush=True)
+            self._report_pointer()
+
+    def _report_pointer(self) -> None:
+        if not self.frames:
+            return
+        hit = self.frames - sum(self.misses.values())
+        why = ", ".join(f"{k} {100 * n / self.frames:.0f}%" for k, n in self.misses.most_common(3))
+        print(f"voice: fingertip on the page in {100 * hit / self.frames:.0f}% of frames"
+              + (f" (missed: {why})" if why else ""), flush=True)
 
     def toggle(self) -> bool:
         """Start or stop recording; returns True if now recording."""
@@ -290,8 +333,14 @@ class VoiceNotes:
             self.start()
         return self.recording
 
-    def add_pointer(self, t: float, uv: Tuple[float, float]) -> None:
-        if self.recording:
+    def add_pointer(self, t: float, uv: Optional[Tuple[float, float]], status: str = "ok") -> None:
+        """This frame's fingertip (None = not usable, `status` says why). Kept while recording."""
+        if not self.recording:
+            return
+        self.frames += 1
+        if uv is None:
+            self.misses[status] += 1
+        else:
             self.pointer.add(t, float(uv[0]), float(uv[1]))
 
     def wait(self, timeout: Optional[float] = None) -> bool:
@@ -303,12 +352,25 @@ class VoiceNotes:
                 return False
         return True
 
-    def notes(self) -> List[Note]:
-        """One note per transcribed sentence, in speaking order, with its pointer position."""
-        out = []
+    def notes(self, after: float = 0.5) -> List[Note]:
+        """Comments, in speaking order. A sentence starts a new comment where the fingertip was
+        when it began (PointerLog.at). If the finger wasn't on the page then:
+        * finger not seen since the previous comment -> appended to that comment;
+        * finger seen since (e.g. pointed, then lifted before talking) -> new comment at the
+          last fingertip position."""
+        out: List[Note] = []
         for rec in self.recordings:
             for start, end, text in rec.sentences():
-                out.append(Note(len(out) + 1, text, start, end, self.pointer.at(start, end)))
+                uv = self.pointer.at(start, end)
+                if uv is None:
+                    last = self.pointer.last_before(start)
+                    prev = out[-1] if out else None
+                    if prev is not None and (last is None or last[0] <= prev.end + after):
+                        prev.text += " " + text
+                        prev.end = end
+                        continue
+                    uv = last[1] if last else None
+                out.append(Note(len(out) + 1, text, start, end, uv))
         return out
 
 

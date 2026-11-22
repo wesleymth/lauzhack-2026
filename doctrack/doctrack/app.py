@@ -88,13 +88,22 @@ def draw(frame, tracker, fps, extra=""):
     return out
 
 
-def draw_hands(out, hands, connections, selector, t):
+def draw_hands(out, hands, connections, selector, t, pointer_hand=None, labels=False):
     for h in hands:
         pts = [tuple(int(v) for v in p) for p in h.landmarks]
-        color = (0, 255, 0) if h.pointing else (180, 180, 180)
+        if labels:   # locked (voice notes): green = this fingertip places the notes
+            used = h is pointer_hand
+            color = (0, 255, 0) if used else (180, 180, 180)
+        else:
+            color = (0, 255, 0) if h.pointing else (180, 180, 180)
         for a, b in connections:
             cv2.line(out, pts[a], pts[b], color, 2, cv2.LINE_AA)
         cv2.circle(out, pts[8], 7, color, -1, cv2.LINE_AA)
+        if labels:
+            text = h.handedness + ": " + ("pointing" if h.pointing_any_dir else h.reason_any_dir)
+            org = (pts[0][0] - 60, pts[0][1] + 30)
+            cv2.putText(out, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(out, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
     if selector is not None and selector.tip is not None:
         # progress ring around the fingertip: full circle = selected
         c = tuple(int(v) for v in selector.tip)
@@ -160,8 +169,11 @@ def main(argv=None):
     ap.add_argument("--camera-mic", action="store_true", help="use the LogiInsight camera microphone")
     ap.add_argument("--voice-chunk", type=float, default=10.0,
                     help="seconds of audio per transcription chunk (smaller = notes appear sooner)")
-    ap.add_argument("--note-hand", choices=["Right", "Left"], default="Right",
-                    help="hand whose pointing index finger places the voice notes")
+    ap.add_argument("--note-hand", choices=["Right", "Left", "any"], default="Right",
+                    help="hand tried first to place the voice notes (MediaPipe's label; the other "
+                         "hand is used if this one isn't pointing at the page)")
+    ap.add_argument("--note-any-pose", action="store_true",
+                    help="any index fingertip on the page places notes, not only the pointing pose")
     ap.add_argument("--keep-hand-labels", action="store_true",
                     help="do NOT swap MediaPipe's Left/Right (as Hand_tracker --keep-labels)")
     ap.add_argument("--notes-dir", default="voice_notes", help="where recordings and PDFs go")
@@ -302,22 +314,22 @@ def main(argv=None):
 
             if tracker.locked and not was_locked and voice is not None:
                 voice.reset()                      # new document: new set of notes
-            pointer_uv = None
+            pointer_uv, pointer_hand, pointer_status = None, None, ""
             if voice is not None and tracker.locked:
-                for h in hands:
-                    if h.handedness == args.note_hand and h.pointing:
-                        pointer_uv = tracker.to_doc(*h.tip)
-                        if pointer_uv is not None:
-                            voice.add_pointer(time.time(), pointer_uv)
-                            break
+                from .voice import pick_pointer
+                pointer_uv, pointer_hand, pointer_status = pick_pointer(
+                    hands, tracker.to_doc, args.note_hand, args.note_any_pose)
+                voice.add_pointer(time.time(), pointer_uv, pointer_status)
 
             extra = ""
             if voice is not None and tracker.locked:
                 n = len(voice.notes())
                 extra = (" | REC (v stop)" if voice.recording else " | v record") + f" | {n} note(s), p export"
+                extra += " | finger: " + ("on page" if pointer_uv is not None else pointer_status)
             vis = draw(frame, tracker, fps, extra)
             if hands:
-                draw_hands(vis, hands, hand_tracker.connections, selector, now)
+                draw_hands(vis, hands, hand_tracker.connections, selector, now,
+                           pointer_hand=pointer_hand, labels=tracker.locked)
             state["scale"] = min(1.0, args.display_width / float(vis.shape[1]))
             if state["scale"] < 1.0:
                 vis = cv2.resize(vis, None, fx=state["scale"], fy=state["scale"],
