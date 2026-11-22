@@ -9,12 +9,14 @@ tracking, ../Hand_tracker), or with a left click. Right click or r releases.
 While locked, only that document is tracked and it is never dropped.
 Scan window: freely resizable; the warp is recomputed at the window's size, so
 the scan always fills it. Buttons (or keys): Rotate 90 (o), Mirror (m).
-Keys (any window): Esc/q quit, r release, o rotate, m mirror, s save scan PNG, d debug.
+Keys (any window): Esc/q quit, r release, o rotate, m mirror, s save scan PNG, d debug,
+e lock / unlock the camera exposure (lock it when the docs look right: stops wash-out).
 
 Remote control (e.g. the Logitech plugin), POST on http://127.0.0.1:8765/
     rotate, mirror, release, save, quit, format/<auto|a4p|a4l|photo>
     audio/on, audio/off       start / stop the voice-note recording
     face                      show / hide the recognised face thumbnail
+    exposure                  lock / unlock the camera exposure
     share/pdf                 export the scan as a PDF (no notes)
     share/pdf-notes           export the scan as a PDF with the voice notes
 
@@ -47,7 +49,7 @@ SDK_DIR = Path(__file__).resolve().parents[2] / "logiinsight_api"
 
 FORMATS = ("auto", "a4p", "a4l", "photo")
 REMOTE_COMMANDS = ("rotate", "mirror", "release", "save", "quit",
-                   "face", "audio/on", "audio/off", "share/pdf", "share/pdf-notes")
+                   "face", "exposure", "audio/on", "audio/off", "share/pdf", "share/pdf-notes")
 
 
 def open_source(args):
@@ -96,7 +98,7 @@ def draw(frame, tracker, fps, extra=""):
         w, h = tracker.scan_size
         status = f"{fps:5.1f} fps | LOCKED #{tracker.selected.id} ({w}x{h}) | r / right-click to release{extra}"
     else:
-        status = f"{fps:5.1f} fps | {len(tracker.tracks)} doc(s) | point at a document (1 s) or click"
+        status = f"{fps:5.1f} fps | {len(tracker.tracks)} doc(s) | point at a document (1 s) or click{extra}"
     cv2.putText(out, status, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
     cv2.putText(out, status, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
     return out
@@ -339,6 +341,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cap = open_source(args)
+    from .exposure import ExposureLock
+    exposure = ExposureLock() if not args.video else None
     tracker = DocumentTracker(OpenCVDocumentDetector(DetectorConfig(doc_up=args.doc_up)), paper=args.paper,
                               scan_long_side=args.scan_size)
     state = {"scale": 1.0, "debug": False}
@@ -574,6 +578,7 @@ def main(argv=None):
                    debug=toggle_debug, voice=toggle_voice, export=export, enroll=enroll,
                    audio_on=audio_on, audio_off=audio_off, face=toggle_faces,
                    share_pdf=share_pdf, share_pdf_notes=share_pdf_notes,
+                   exposure=lambda: exposure and exposure.toggle(),
                    quit=lambda: state.update(quit=True))
     ui = UI(actions)
     ui.layout()                                  # teacher view left 2/3, student view right 1/3
@@ -635,10 +640,10 @@ def main(argv=None):
                     hands, tracker.to_doc, args.note_hand, args.note_any_pose)
                 voice.add_pointer(t_capture, pointer_uv, pointer_status)
 
-            extra = ""
+            extra = " | EXPOSURE LOCKED (e)" if exposure is not None and exposure.locked else ""
             if voice is not None and tracker.locked:
                 n = len(voice.notes(max_age=0.5))   # status line only: refresh twice a second
-                extra = (" | REC (v stop)" if voice.recording else " | v record") + f" | {n} note(s), p export"
+                extra += (" | REC (v stop)" if voice.recording else " | v record") + f" | {n} note(s), p export"
                 extra += " | finger: " + ("on page" if pointer_uv is not None else pointer_status)
             vis = draw(frame, tracker, fps, extra)
             if voice is not None and voice.recording:
@@ -697,6 +702,8 @@ def main(argv=None):
             voice.stop()
             print("voice: saving recordings ...")
             voice.wait(timeout=60)
+        if exposure is not None:
+            exposure.close()
         cap.release()
         if hand_tracker is not None:
             hand_tracker.close()
