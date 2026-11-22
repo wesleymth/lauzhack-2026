@@ -26,7 +26,7 @@ from .tracker import DocumentTracker
 
 CORNER_COLORS = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)]  # doc TL TR BR BL (BGR)
 CORNER_NAMES = ["TL", "TR", "BR", "BL"]
-STATE_COLORS = {"tracking": (0, 255, 0), "partial": (0, 220, 255), "searching": (0, 120, 255)}
+STATE_COLORS = {"tracking": (0, 255, 0), "partial": (0, 220, 255), "covered": (0, 220, 255), "searching": (0, 120, 255)}
 SDK_DIR = Path(__file__).resolve().parents[2] / "logiinsight_api"
 
 
@@ -196,7 +196,7 @@ def main(argv=None):
                 continue
             now = time.perf_counter()
             hands = []
-            if hand_tracker is not None and not tracker.locked:   # only needed to select
+            if hand_tracker is not None:          # select by pointing; "covered" while locked
                 hands = hand_tracker.detect(frame, now)
             tracker.update(frame, now, occluders=[h.hull for h in hands])
             if selector is not None:
