@@ -26,6 +26,13 @@ not gone, so it doesn't vanish while you point at it.
 
 **Browse mode:** calm on purpose (a desk is a slow scene). A document is only shown after it has been
 detected confidently for about 1/3 s. At most 3 are shown, and they are smoothed heavily. **Left click** one to lock.
+**Locked mode, macOS (default):** the selected page is tracked with Apple's pretrained document detector
+(Vision, about 5 ms per frame) run on a crop around the page. A result is used only if it is confident and has the
+page's size, shape and content. With a hand on the page (from the hand tracker), the outline holds still. If the
+page area hasn't changed, the outline doesn't move at all. If the page disappears, it is searched for with wider
+crops and halves of the frame. See `doctrack/vision_track.py`. Use `DocumentTracker(..., lock_backend="classic")`
+for the OpenCV tracker described below (used automatically where Vision isn't available).
+
 **Locked mode:** only that document is tracked and it is never dropped. Each corner is handled on its own: a
 corner covered by a hand or pen (hollow circle) keeps its **last position**, and that position is used for the warp.
 This works for 1, 2, 3 or all 4 corners. When uncovered, it is searched for starting at its last position and going

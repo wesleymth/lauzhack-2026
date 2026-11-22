@@ -1,1 +1,3 @@
 voice_notes/
+# DocAligner model weights: downloaded automatically on first use
+models/*.onnx

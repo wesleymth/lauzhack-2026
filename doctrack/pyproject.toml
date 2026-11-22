@@ -7,8 +7,10 @@ dependencies = [
     "mediapipe>=0.10.14",
     "numpy>=1.24",
     # GUI build (NOT headless): the app uses cv2.imshow
+    "onnxruntime>=1.17",
     "opencv-python>=4.8",
     "pillow>=9",
+    "pyobjc-framework-vision>=10 ; sys_platform == 'darwin'",
     # voice notes (v) + PDF export (p): reuses ../speech/stt.py
     "faster-whisper>=1.0",
     "sounddevice>=0.4.6",

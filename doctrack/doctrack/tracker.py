@@ -20,6 +20,8 @@ import numpy as np
 from .filters import OneEuroFilter
 from .geometry import point_in_quad, quad_area, quad_iou, warp_document
 from .locked import LockedTracker
+from .docaligner import DocAlignerModel, docaligner_available
+from .vision_track import VisionLockedTracker
 
 _UNIT = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)  # TL TR BR BL
 
@@ -46,8 +48,18 @@ class Track:
 class DocumentTracker:
     def __init__(self, detector, paper: str = "a4", scan_long_side: int = 1100,
                  max_docs: int = 3, min_hits: int = 10, min_score: float = 0.6,
-                 new_score: float = 0.45, match_iou: float = 0.3, max_misses: int = 30) -> None:
+                 new_score: float = 0.45, match_iou: float = 0.3, max_misses: int = 30,
+                 lock_backend: str = "auto") -> None:
+        """lock_backend: how a selected document is tracked. "docaligner" =
+        pretrained DocAligner corner model (onnxruntime), "vision" = Apple's
+        document detector (macOS), "classic" = the OpenCV tracker, "auto" =
+        docaligner when onnxruntime is available."""
         self.detector = detector
+        if lock_backend == "auto":
+            lock_backend = "docaligner" if docaligner_available() else "classic"
+        self.lock_backend = lock_backend
+        self._last_occluders: List[np.ndarray] = []
+        self._model = None                                # corner model, loaded on first lock
         self.max_docs = max_docs
         self.min_score = min_score
         self.new_score = new_score
@@ -115,8 +127,15 @@ class DocumentTracker:
         t = self._tracks.get(track_id)
         if t is None or self._last_frame is None:
             return False
-        self._lock = LockedTracker(self._last_frame, t.corners, self._last_t, paper=self.paper,
-                                   scan_long_side=self.scan_long_side)
+        if self.lock_backend in ("vision", "docaligner"):
+            if self._model is None:
+                self._model = DocAlignerModel() if self.lock_backend == "docaligner" else None
+            self._lock = VisionLockedTracker(self._last_frame, t.corners, self._last_t, paper=self.paper,
+                                             scan_long_side=self.scan_long_side,
+                                             occluders=self._last_occluders, detector=self._model)
+        else:
+            self._lock = LockedTracker(self._last_frame, t.corners, self._last_t, paper=self.paper,
+                                       scan_long_side=self.scan_long_side)
         self._lock_track = Track(t.id, self._lock.corners.copy(), t.score, t.hits)
         self._reset_orientation()
         self._tracks.clear()  # stop tracking everything else
@@ -173,8 +192,12 @@ class DocumentTracker:
         covered, not gone: it keeps its position, ID and confidence."""
         t = time.perf_counter() if t is None else t
         self._last_frame, self._last_t = frame, t
+        self._last_occluders = list(occluders or [])
         if self._lock is not None:
-            self._lock.update(frame, t, self.detector)
+            if self.lock_backend in ("vision", "docaligner"):
+                self._lock.update(frame, t, self.detector, occluders=self._last_occluders)
+            else:
+                self._lock.update(frame, t, self.detector)
             self._lock_track.state = self._lock.state
             self._sync_lock_track()
             return [self._lock_track]
