@@ -36,6 +36,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 SPEECH_DIR = Path(__file__).resolve().parents[2] / "speech"
+SENTENCE_END = (".", "?", "!")
 UNIT = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)  # TL TR BR BL
 
 
@@ -103,12 +104,16 @@ class Fixation:
 
 
 def find_fixations(t: Sequence[float], uv: Sequence[Tuple[float, float]], radius: float = 0.05,
-                   hold: float = 0.4, aspect: float = 2 ** 0.5, max_gap: float = 0.5) -> List[Fixation]:
+                   hold: float = 0.4, aspect: float = 2 ** 0.5,
+                   max_gap: Optional[float] = None) -> List[Fixation]:
     """Where the finger stopped, in time order.
 
     A new fixation starts only when the fingertip moves more than `radius` (fraction of the
     page width) away from the current one AND stays within `radius` of its new spot for `hold`
-    seconds (samples at most `max_gap` apart). Jitter and small moves stay in the current
+    seconds (at least 2 samples, at most `max_gap` apart). `max_gap` defaults to 2.5x the
+    median time between samples (at least 0.5 s): the app can run at only 1-2 frames per
+    second while it records, transcribes and tracks hands, so a fixed gap would reject
+    every stop. Jitter and small moves stay in the current
     fixation; passing over the page on the way somewhere doesn't create one. A fixation's
     start is when the finger ARRIVED at the spot, not when the hold was confirmed. `aspect` =
     page height / width, so distances are physical. The centre is the median of its samples.
@@ -116,10 +121,14 @@ def find_fixations(t: Sequence[float], uv: Sequence[Tuple[float, float]], radius
     def far(a, b):
         return ((a[0] - b[0]) ** 2 + ((a[1] - b[1]) * aspect) ** 2) > radius ** 2
 
+    samples = sorted(zip(t, uv), key=lambda s: s[0])
+    if max_gap is None:
+        dt = np.diff([s[0] for s in samples])
+        max_gap = max(0.5, 2.5 * float(np.median(dt))) if len(dt) else 0.5
     fixations, members = [], []            # members[i]: samples of fixations[i]
     cur_mean = None                         # running mean of the current fixation
     cand, cand_last = [], None              # samples of a possible new fixation
-    for ti, p in sorted(zip(t, uv), key=lambda s: s[0]):
+    for ti, p in samples:
         if cur_mean is not None and not far(p, cur_mean):
             members[-1].append(p)
             k = len(members[-1])
@@ -131,7 +140,7 @@ def find_fixations(t: Sequence[float], uv: Sequence[Tuple[float, float]], radius
         else:
             cand.append((ti, p))
         cand_last = ti
-        if ti - cand[0][0] >= hold:          # stayed long enough: it's a real stop
+        if len(cand) >= 2 and ti - cand[0][0] >= hold:   # stayed long enough: a real stop
             pts = [q for _, q in cand]
             fixations.append(Fixation(cand[0][0], pts[0], len(pts)))
             members.append(pts)
@@ -410,19 +419,33 @@ class VoiceNotes:
         if key == cached_key or (max_age and time.time() - cached_t < max_age):
             return [replace(n) for n in cached]
         fixations = self.fixations()
-        starts = [f.t0 - self.lead for f in fixations]
+        # Words may belong to a stop that began up to `lead` s after them: you start talking as
+        # the finger settles, and at a low frame rate the arrival is only seen one sample late.
+        dt = np.diff(self.pointer.t) if len(self.pointer.t) > 1 else np.zeros(0)
+        lead = max(self.lead, float(np.median(dt)) if len(dt) else 0.0)
+        starts = [f.t0 - lead for f in fixations]
         words = sorted(w for rec in self.recordings for w in rec.words())
-        out: List[Note] = []
-        current = object()                   # fixation index of the open comment
+
+        groups: List[list] = []              # [stop index, [(t, word), ...]]
         for tw, word in words:
             i = bisect.bisect_right(starts, tw) - 1          # -1: before any stop
-            if out and i == current:
-                out[-1].text += " " + word
-                out[-1].end = tw
+            if groups and groups[-1][0] == i:
+                groups[-1][1].append((tw, word))
             else:
-                uv = fixations[i].uv if i >= 0 else None
-                out.append(Note(len(out) + 1, word, tw, tw, uv))
-                current = i
+                groups.append([i, [(tw, word)]])
+        # A split 1-2 words after a sentence end moves to that sentence end.
+        for prev, nxt in zip(groups, groups[1:]):
+            ws = prev[1]
+            for k in range(len(ws) - 2, max(len(ws) - 4, 0) - 1, -1):
+                if ws[k][1].rstrip("\"')]").endswith(SENTENCE_END):
+                    nxt[1][:0] = ws[k + 1:]
+                    del ws[k + 1:]
+                    break
+        out: List[Note] = []
+        for i, ws in groups:
+            if ws:
+                out.append(Note(len(out) + 1, " ".join(w for _, w in ws), ws[0][0], ws[-1][0],
+                                fixations[i].uv if i >= 0 else None))
         self._cache = (key, time.time(), out)
         return [replace(n) for n in out]
 
