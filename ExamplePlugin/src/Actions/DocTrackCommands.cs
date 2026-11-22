@@ -286,23 +286,65 @@ namespace Loupedeck.ExamplePlugin
             => Icons.Get(this._on ? "mic_on" : "mic_off", imageSize);
     }
 
-    // Start: launches the Python app (doctrack/start.command) in a Terminal window.
-    // Terminal already has camera + microphone access and keeps the log visible; the plugin
-    // service itself would have neither uv on its PATH nor those permissions.
-    public class StartCommand : PluginDynamicCommand
+    // Start / Stop in one button.
+    // Not running: launches the Python app (doctrack/start.command) in a Terminal window;
+    // Terminal already has camera + microphone access and keeps the log visible (the plugin
+    // service itself has neither uv on its PATH nor those permissions).
+    // Running: asks it to quit (it closes the windows and releases the camera).
+    // The icon shows what a press will do, and follows the app even when it is started or
+    // quit some other way (checked every second).
+    public class StartStopCommand : PluginDynamicCommand
     {
-        public StartCommand()
-            : base(displayName: "Start", description: "Start DocTrack", groupName: "DocTrack")
+        private static readonly TimeSpan BootTime = TimeSpan.FromSeconds(40);
+
+        private Boolean _running;
+        private DateTime _startingUntil = DateTime.MinValue;   // launched, control port not up yet
+        private readonly System.Threading.Timer _poll;
+
+        public StartStopCommand()
+            : base(displayName: "Start / Stop", description: "Start DocTrack, or stop it if it is running",
+                   groupName: "DocTrack")
         {
+            this._running = DocTrackClient.IsRunning();
+            this._poll = new System.Threading.Timer(_ => this.Refresh(), null, 1000, 1000);
+        }
+
+        private Boolean Starting => !this._running && DateTime.UtcNow < this._startingUntil;
+
+        private void Refresh()
+        {
+            var running = DocTrackClient.IsRunning();
+            if (running)
+            {
+                this._startingUntil = DateTime.MinValue;
+            }
+            if (running != this._running)
+            {
+                this._running = running;
+                this.ActionImageChanged();
+            }
         }
 
         protected override void RunCommand(String actionParameter)
         {
-            if (DocTrackClient.IsRunning())
+            this._running = DocTrackClient.IsRunning();
+            if (this._running)
             {
-                PluginLog.Info("DocTrack is already running");
-                return;
+                DocTrackClient.Send("quit");
             }
+            else if (this.Starting)
+            {
+                PluginLog.Info("DocTrack is still starting");
+            }
+            else
+            {
+                this.Launch();
+            }
+            this.ActionImageChanged();
+        }
+
+        private void Launch()
+        {
             var script = DocTrackClient.FindStartScript();
             if (script == null)
             {
@@ -316,6 +358,7 @@ namespace Loupedeck.ExamplePlugin
                 psi.ArgumentList.Add("Terminal");
                 psi.ArgumentList.Add(script);
                 System.Diagnostics.Process.Start(psi);
+                this._startingUntil = DateTime.UtcNow + BootTime;
                 PluginLog.Info($"Starting DocTrack: {script}");
             }
             catch (Exception ex)
@@ -325,20 +368,17 @@ namespace Loupedeck.ExamplePlugin
         }
 
         protected override BitmapImage GetCommandImage(String actionParameter, PluginImageSize imageSize)
-            => Icons.Get("start", imageSize);
-    }
-
-    // Stop: asks the running Python app to quit (it closes the windows and releases the camera).
-    public class StopCommand : PluginDynamicCommand
-    {
-        public StopCommand()
-            : base(displayName: "Stop", description: "Stop DocTrack", groupName: "DocTrack")
         {
+            if (!this.Starting)
+            {
+                return Icons.Get(this._running ? "stop" : "start", imageSize);
+            }
+            using (var b = new BitmapBuilder(imageSize))   // booting: start icon with "..."
+            {
+                b.DrawImage(Icons.Get("start", imageSize), 0, 0, b.Width, b.Height);
+                b.DrawText("...", 0, b.Height - 30, b.Width, 28, new BitmapColor(64, 196, 255), 22);
+                return b.ToImage();
+            }
         }
-
-        protected override void RunCommand(String actionParameter) => DocTrackClient.Send("quit");
-
-        protected override BitmapImage GetCommandImage(String actionParameter, PluginImageSize imageSize)
-            => Icons.Get("stop", imageSize);
     }
 }
