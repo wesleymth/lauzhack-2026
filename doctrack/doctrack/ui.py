@@ -9,8 +9,6 @@ v voice note recording on/off, p export PDF with the notes, q / Esc quit. Camera
 Scan window: freely resizable (its size is the warp size), Rotate / Mirror buttons.
 """
 
-import subprocess
-import sys
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Dict, Optional, Tuple
@@ -52,6 +50,7 @@ class UI:
         self.scan.set_content_size(*scan_size)
 
         self._export: Optional["ExportPopup"] = None
+        self._export_debug: Optional["ExportDebugWindow"] = None
         self._debug_top: Optional[tk.Toplevel] = None
         self._debug_view = None
         self._debug_photo = None
@@ -97,9 +96,14 @@ class UI:
         if self._export is None or self._export.progress is not progress:   # a new export
             if self._export is not None:
                 self._export.close()
+            if self._export_debug is not None:
+                self._export_debug.close()
+            self._export_debug = ExportDebugWindow(self.root, progress.model)
             self._export = ExportPopup(self.root)
             self._export.progress = progress
-        if self._export.alive:                     # closed by the user: stays closed
+        if self._export_debug.alive:               # closed by the user: stays closed
+            self._export_debug.render(progress)
+        if self._export.alive:
             self._export.render(progress)
 
     def update(self) -> None:
@@ -119,8 +123,11 @@ class UI:
 
 
 class ExportPopup:
-    """Small always-on-top window: stage text, progress bar, elapsed time; then the result
-    with Open / Show in Finder buttons."""
+    """Small always-on-top window: thumbnail of the captured page, stage text, progress bar,
+    elapsed time. When the export is done it says where the PDF is and closes itself after
+    CLOSE_AFTER_S; on an error it stays open with a Close button."""
+
+    CLOSE_AFTER_S = 2.0
 
     def __init__(self, root: tk.Tk) -> None:
         self.top = tk.Toplevel(root)
@@ -128,8 +135,17 @@ class ExportPopup:
         self.top.resizable(False, False)
         self.top.attributes("-topmost", True)
         self.top.protocol("WM_DELETE_WINDOW", self.close)
-        frame = tk.Frame(self.top, padx=18, pady=14)
-        frame.pack(fill="both", expand=True)
+        outer = tk.Frame(self.top, padx=14, pady=14)
+        outer.pack(fill="both", expand=True)
+        left = tk.Frame(outer)
+        left.pack(side="left", anchor="n", padx=(0, 14))
+        self._thumb = tk.Label(left, bd=1, relief="solid")     # the page frozen at p
+        self._thumb.pack()
+        self._thumb_caption = tk.Label(left, text="", fg="#777777", font=("TkDefaultFont", 10))
+        self._thumb_caption.pack()
+        self._thumb_photo = None
+        frame = tk.Frame(outer)
+        frame.pack(side="left", fill="both", expand=True)
         self._title = tk.Label(frame, text="Exporting PDF ...", font=("TkDefaultFont", 13, "bold"),
                                anchor="w")
         self._title.pack(fill="x")
@@ -154,6 +170,12 @@ class ExportPopup:
     def render(self, p) -> None:
         if not self.alive or self._shown_done:
             return
+        if self._thumb_photo is None and p.snapshot is not None:
+            h = 150
+            w = max(1, int(p.snapshot.shape[1] * h / p.snapshot.shape[0]))
+            self._thumb_photo = _photo(cv2.resize(p.snapshot, (w, h), interpolation=cv2.INTER_AREA))
+            self._thumb.configure(image=self._thumb_photo)
+            self._thumb_caption.configure(text=f"captured {p.captured_at}")
         label, frac, detail = p.status()
         if p.done or p.error:
             self._finish(p)
@@ -174,12 +196,75 @@ class ExportPopup:
             self._title.configure(text="PDF exported")
             self._stage.configure(text=f"{p.notes} comment(s){' + summary' if p.summary else ''}")
             self._detail.configure(text=f"Saved to {path}")
-            if sys.platform == "darwin":
-                ttk.Button(self._buttons, text="Open PDF",
-                           command=lambda: subprocess.Popen(["open", str(path)])).pack(side="left")
-                ttk.Button(self._buttons, text="Show in Finder",
-                           command=lambda: subprocess.Popen(["open", "-R", str(path)])).pack(side="left", padx=6)
-        ttk.Button(self._buttons, text="Close", command=self.close).pack(side="right")
+            self.top.after(int(self.CLOSE_AFTER_S * 1000), self.close)   # done: the popup goes away
+            return
+        ttk.Button(self._buttons, text="Close", command=self.close).pack(side="right")  # error: stays
+
+    def close(self) -> None:
+        self.alive = False
+        try:
+            self.top.destroy()
+        except tk.TclError:
+            pass
+
+
+class ExportDebugWindow:
+    """Terminal-style log of the export: OCR text, kept / dropped comments, and the LLM's
+    answer streamed as it is written, under a header with the model's name and state."""
+
+    COLORS = {"header": "#58a6ff", "info": "#8b949e", "ocr": "#e6edf3", "keep": "#7ee787",
+              "drop": "#ff7b72", "llm": "#d2a8ff"}
+    STATE = {None: "starting", "wait": "waiting for the transcription", "ocr": "idle - OCR running",
+             "summary": "working - writing the summary", "pdf": "done"}
+
+    def __init__(self, root: tk.Tk, model: str) -> None:
+        self.top = tk.Toplevel(root)
+        self.model = model or "no LLM (--no-llm)"
+        self.top.title(f"Export debug - {self.model}")
+        self.top.configure(bg="#0d1117")
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
+        self.top.geometry("640x560+40+60")
+        bar = tk.Frame(self.top, bg="#161b22", padx=12, pady=8)
+        bar.pack(side="top", fill="x")
+        tk.Label(bar, text=self.model, bg="#161b22", fg="#d2a8ff",
+                 font=("Menlo", 16, "bold")).pack(side="left")
+        self._state = tk.Label(bar, text="", bg="#161b22", fg="#8b949e", font=("Menlo", 12))
+        self._state.pack(side="right")
+        body = tk.Frame(self.top, bg="#0d1117")
+        body.pack(fill="both", expand=True)
+        scroll = tk.Scrollbar(body)
+        scroll.pack(side="right", fill="y")
+        self.text = tk.Text(body, bg="#0d1117", fg="#c9d1d9", font=("Menlo", 12), wrap="word",
+                            bd=0, padx=12, pady=10, highlightthickness=0, yscrollcommand=scroll.set)
+        self.text.pack(side="left", fill="both", expand=True)
+        scroll.configure(command=self.text.yview)
+        for tag, color in self.COLORS.items():
+            self.text.tag_configure(tag, foreground=color)
+        self.text.tag_configure("header", font=("Menlo", 12, "bold"))
+        self.text.configure(state="disabled")
+        self._n = 0
+        self._dots = 0
+        self.alive = True
+
+    def render(self, p) -> None:
+        if not self.alive:
+            return
+        state = "error" if p.error else "done" if p.done else self.STATE.get(p.current, p.current)
+        if p.current == "summary" and not (p.done or p.error):
+            self._dots = (self._dots + 1) % 24
+            state += "." * (1 + self._dots // 8)                # simple activity indicator
+        self._state.configure(text=state, fg="#7ee787" if p.done else "#ff7b72" if p.error else "#8b949e")
+        new = p.lines[self._n:]
+        if not new:
+            return
+        at_end = self.text.yview()[1] > 0.98
+        self.text.configure(state="normal")
+        for text, tag in new:
+            self.text.insert("end", text, tag)
+        self.text.configure(state="disabled")
+        self._n += len(new)
+        if at_end:
+            self.text.see("end")                                 # follow, unless you scrolled up
 
     def close(self) -> None:
         self.alive = False

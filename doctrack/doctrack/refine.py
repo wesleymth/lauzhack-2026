@@ -131,43 +131,80 @@ def text_near(lines, uv, k: int = 2, max_dist: float = 0.12) -> str:
 # LLM (Ollama)
 # --------------------------------------------------------------------------- #
 
-def ask_ollama(page: str, comments: List[dict], model: str, url: str, timeout: float = 300) -> str:
-    """The summary, as plain text."""
+def ask_ollama(page: str, comments: List[dict], model: str, url: str, timeout: float = 300,
+               on_token: Optional[Callable[[str], None]] = None) -> str:
+    """The summary, as plain text. Streamed: `on_token(piece)` is called as the model writes."""
     said = "\n".join(f"- ({c['near']}) {c['said']}" if c["near"] else f"- {c['said']}"
                      for c in comments) or "(none)"
     user = ("DOCUMENT TEXT:\n" + (page[:MAX_PAGE_CHARS] or "(no text found)")
             + "\n\nREADER'S COMMENTS (in brackets: the document text they point at):\n" + said)
     body = {
-        "model": model, "stream": False, "think": False, "keep_alive": 0,
+        "model": model, "stream": True, "think": False, "keep_alive": 0,
         "options": {"temperature": 0.2, "num_ctx": 4096, "num_predict": 200},
         "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
     }
     req = urllib.request.Request(url.rstrip("/") + "/api/chat", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
+    pieces = []
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        text = json.loads(r.read())["message"]["content"]
+        for line in r:                                   # one JSON object per line
+            if not line.strip():
+                continue
+            msg = json.loads(line)
+            if msg.get("error"):
+                raise RuntimeError(msg["error"])
+            piece = msg.get("message", {}).get("content", "")
+            if piece:
+                pieces.append(piece)
+                if on_token:
+                    on_token(piece)
+            if msg.get("done"):
+                break
+    text = "".join(pieces)
     return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
 
 
 def refine_notes(scan_bgr: np.ndarray, notes: Sequence[Note], view: Optional[np.ndarray] = None,
                  model: str = "qwen3:0.6b", url: str = "http://localhost:11434",
                  log_path: Optional[Path] = None,
-                 on_stage: Optional[Callable[[str], None]] = None) -> Tuple[Optional[str], List[Note]]:
+                 on_stage: Optional[Callable[[str], None]] = None,
+                 log: Optional[Callable[[str, str], None]] = None) -> Tuple[Optional[str], List[Note]]:
     """(summary, notes): notes reduced to what the page doesn't already say; the spoken text
     is kept in Note.original. Raises if OCR fails; an LLM failure only loses the summary.
-    `on_stage("ocr" | "summary")` is called as each step starts (progress display)."""
+    `on_stage("ocr" | "summary")` is called as each step starts (progress display);
+    `log(text, tag)` gets a running debug transcript (tags: header, info, ocr, keep, drop, llm)."""
     stage = on_stage or (lambda name: None)
+    log = log or (lambda text, tag="info": None)
     stage("ocr")
+    log("OCR  -  PP-OCRv6 tiny (PaddleOCR, ONNX Runtime)\n", "header")
+    log("reading the page ...\n", "info")
     t0 = time.time()
     lines = ocr_page(scan_bgr)
     page = page_text(lines)
     print(f"refine: OCR {len(lines)} lines in {time.time() - t0:.1f}s", flush=True)
+    for text, _ in lines:
+        log(text + "\n", "ocr")
+    log(f"{len(lines)} lines in {time.time() - t0:.1f} s\n\n", "info")
 
+    log("COMMENTS  -  one per finger stop (word-level anchors); parts that repeat the page "
+        "are removed\n", "header")
     kept = []
     for n in notes:
         text = strip_repeats(n.text, page)
+        where = ("no pointer" if n.uv is None else
+                 "at (%.2f, %.2f)" % to_view(n.uv, view)) + f", {len(n.text.split())} words, " \
+                f"{n.end - n.start:.1f} s"
+        log(f"#{n.index} {where}\n", "info")
         if text:
             kept.append(replace(n, text=text, original=n.text))
+            log(f"#{n.index} kept: {text}\n", "keep")
+            if text != n.text.strip():
+                log(f"    spoken: {n.text}\n", "info")
+        else:
+            log(f"#{n.index} dropped (only repeats the page): {n.text}\n", "drop")
+    if not notes:
+        log("(no comments)\n", "info")
+    log("\n", "info")
     if len(kept) < len(notes):
         print(f"refine: {len(notes) - len(kept)} note(s) only repeated the page, dropped", flush=True)
 
@@ -178,11 +215,22 @@ def refine_notes(scan_bgr: np.ndarray, notes: Sequence[Note], view: Optional[np.
         stage("summary")
         t1 = time.time()
         print(f"refine: asking {model} for a summary ...", flush=True)
+        log(f"LLM  -  {model}  (Ollama, local)\n", "header")
+        log("loading the model and reading the prompt ...\n", "info")
+        first = []
+
+        def token(piece):
+            if not first:
+                first.append(time.time())
+                log(f"first word after {first[0] - t1:.1f} s\n", "info")
+            log(piece, "llm")
         try:
-            summary = ask_ollama(page, comments, model, url) or None
+            summary = ask_ollama(page, comments, model, url, on_token=token) or None
             print(f"refine: {model} answered in {time.time() - t1:.1f}s", flush=True)
+            log(f"\n\ndone in {time.time() - t1:.1f} s\n", "info")
         except Exception as e:  # noqa: BLE001  Ollama down / model missing
             print(f"refine: {model} failed ({type(e).__name__}: {e}); no summary", flush=True)
+            log(f"\nfailed: {type(e).__name__}: {e} - no summary\n", "drop")
 
     if log_path is not None:
         Path(log_path).write_text(json.dumps(
