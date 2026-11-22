@@ -25,6 +25,8 @@ from .vision_track import VisionLockedTracker
 
 _UNIT = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)  # TL TR BR BL
 
+_UNIT = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)  # TL TR BR BL
+
 
 @dataclass
 class Track:

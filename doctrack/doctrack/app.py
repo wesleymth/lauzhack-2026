@@ -236,6 +236,8 @@ def main(argv=None):
     ap.add_argument("--ollama-url", default="http://localhost:11434")
     ap.add_argument("--download-dir", default="~/Downloads",
                     help="the exported PDF is also copied here ('' = don't)")
+    ap.add_argument("--faces", action="store_true",
+                    help="recognise enrolled faces (f = enroll the face in view)")
     args = ap.parse_args(argv)
 
     cap = open_source(args)
@@ -253,6 +255,16 @@ def main(argv=None):
             print(f"hand tracking unavailable ({e}); click to select")
 
     voice = None
+    
+    face_rec = None
+    if args.faces:
+        try:
+            from .faces import FaceRecognizer
+            face_rec = FaceRecognizer()
+            print(f"faces on: {len(face_rec.db)} enrolled, f = enroll")
+        except Exception as e:  # model download failed / old OpenCV: keep running without
+            print(f"faces unavailable ({e})")
+            
     if not args.no_voice:
         from .voice import VoiceNotes
         voice = VoiceNotes(Path(args.notes_dir), mic=args.mic, camera_mic=args.camera_mic,
@@ -372,8 +384,21 @@ def main(argv=None):
         if not state["debug"]:
             ui.show_debug(None)
 
+    def enroll():
+        if face_rec is None:
+            return
+        frame = state.get("frame")
+        if frame is None:
+            return
+        frame = frame.copy()                 # the dialog blocks the loop: keep this frame
+        from tkinter import simpledialog
+        name = simpledialog.askstring("Enroll face", "Name?", parent=ui.root)
+        if not name:
+            return
+        print(f"enrolled {name}" if face_rec.enroll(name.strip(), frame) else "enroll: no face seen")
+
     actions = dict(click=click, release=release, rotate=rotate, mirror=mirror, save=save,
-                   debug=toggle_debug, voice=toggle_voice, export=export,
+                   debug=toggle_debug, voice=toggle_voice, export=export, enroll=enroll,
                    quit=lambda: state.update(quit=True))
     ui = UI(actions)
     fit_scan_window()
@@ -420,6 +445,11 @@ def main(argv=None):
             if hands:
                 draw_hands(vis, hands, hand_tracker.connections, selector, now,
                            pointer_hand=pointer_hand, labels=tracker.locked)
+            faces = []
+            if face_rec is not None:
+                from .faces import draw as draw_faces
+                faces = face_rec.identify(frame)
+                draw_faces(vis, faces)
             state["scale"] = min(1.0, args.display_width / float(vis.shape[1]))
             if state["scale"] < 1.0:
                 vis = cv2.resize(vis, None, fx=state["scale"], fy=state["scale"],
@@ -435,6 +465,10 @@ def main(argv=None):
             state["scan"] = scan
             if scan is not None and voice is not None:
                 scan = draw_notes(scan, voice.notes(), tracker.view_transform(), pointer_uv, voice.recording)
+            if scan is not None and face_rec is not None:
+                from .faces import draw_thumbs
+                scan = scan.copy()                 # keep state["scan"] clean: the s key saves it
+                draw_thumbs(scan, frame, faces, size=0.2)
             ui.scan.show(scan if scan is not None else placeholder(ww, wh))
             ui.scan.set_state(tracker.locked, tracker.mirrored)
 
