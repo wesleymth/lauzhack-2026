@@ -403,8 +403,6 @@ def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
     import cv2
     from PIL import Image
     from pypdf import PdfReader, PdfWriter
-    from pypdf.annotations import Text
-    from pypdf.generic import ArrayObject, FloatObject, NameObject, TextStringObject
 
     path = Path(path)
     h, w = scan_bgr.shape[:2]
@@ -419,11 +417,7 @@ def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
 
     if summary:     # summary comment in the top-right corner, opened by default
         x, y = 0.96 * pw, 0.97 * ph
-        annot = Text(rect=(x - 12, y - 12, x + 12, y + 12), text=summary, open=True)
-        annot[NameObject("/T")] = TextStringObject("Summary")
-        annot[NameObject("/Name")] = NameObject("/Key")
-        annot[NameObject("/C")] = ArrayObject([FloatObject(0.2), FloatObject(0.6), FloatObject(1.0)])
-        writer.add_annotation(page_number=0, annotation=annot)
+        _add_sticky(writer, (x, y), 12, summary, "Summary", "/Key", (0.2, 0.6, 1.0), (pw, ph), open_=True)
         writer.add_metadata({"/Subject": summary})
 
     records = []
@@ -438,12 +432,8 @@ def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
             unplaced += 1
             text = "(no pointer) " + text
         x, y = float(uv[0]) * pw, (1.0 - float(uv[1])) * ph   # PDF origin is bottom-left
-        s = 10.0
-        annot = Text(rect=(x - s, y - s, x + s, y + s), text=text, open=False)
-        annot[NameObject("/T")] = TextStringObject(f"Voice note {n.index} · {time.strftime('%H:%M:%S', time.localtime(n.start))}")
-        annot[NameObject("/Name")] = NameObject("/Comment")
-        annot[NameObject("/C")] = ArrayObject([FloatObject(1.0), FloatObject(0.8), FloatObject(0.0)])
-        writer.add_annotation(page_number=0, annotation=annot)
+        title = f"Voice note {n.index} · {time.strftime('%H:%M:%S', time.localtime(n.start))}"
+        _add_sticky(writer, (x, y), 10, text, title, "/Comment", (1.0, 0.8, 0.0), (pw, ph))
         records.append(n.to_dict(uv_view=None if n.uv is None else uv))
 
     with open(path, "wb") as f:
@@ -451,6 +441,39 @@ def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
     path.with_suffix(".json").write_text(json.dumps(
         {"page_pt": [round(pw, 2), round(ph, 2)], "summary": summary, "notes": records}, indent=1, ensure_ascii=False))
     return path
+
+
+def _add_sticky(writer, xy, s, text, title, icon, color, page_wh, open_=False) -> None:
+    """Add a /Text (sticky note) annotation plus its linked /Popup to page 0.
+
+    pypdf's `Text` helper alone isn't enough for many viewers (macOS Preview,
+    browsers): they need the /Popup annotation to show the text, the flags under
+    the spec key /F (pypdf writes a non-standard /Flags), and /Type /Annot.
+    """
+    from pypdf.annotations import Popup, Text
+    from pypdf.generic import ArrayObject, FloatObject, NameObject, NumberObject, TextStringObject
+
+    x, y = xy
+    pw, ph = page_wh
+    annot = Text(rect=(x - s, y - s, x + s, y + s), text=text, open=open_)
+    annot.pop(NameObject("/Flags"), None)
+    annot[NameObject("/Type")] = NameObject("/Annot")
+    annot[NameObject("/F")] = NumberObject(4 | 8 | 16)          # Print | NoZoom | NoRotate
+    annot[NameObject("/T")] = TextStringObject(title)
+    annot[NameObject("/Name")] = NameObject(icon)
+    annot[NameObject("/C")] = ArrayObject([FloatObject(c) for c in color])
+    annot[NameObject("/M")] = TextStringObject(time.strftime("D:%Y%m%d%H%M%S"))
+    parent = writer.add_annotation(page_number=0, annotation=annot)
+
+    # popup window next to the icon, kept on the page
+    w, h = 220.0, 120.0
+    px0 = min(max(x + s, 0.0), max(pw - w, 0.0))
+    py1 = min(max(y + s, h), ph)
+    popup = Popup(rect=(px0, py1 - h, px0 + w, py1), parent=parent, open=open_)
+    popup[NameObject("/Type")] = NameObject("/Annot")
+    popup[NameObject("/F")] = NumberObject(4 | 8 | 16)
+    popup = writer.add_annotation(page_number=0, annotation=popup)
+    parent[NameObject("/Popup")] = popup.indirect_reference
 
 
 def to_view(uv: Tuple[float, float], view: Optional[np.ndarray]) -> Tuple[float, float]:
