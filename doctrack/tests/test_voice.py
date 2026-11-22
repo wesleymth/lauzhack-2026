@@ -44,16 +44,6 @@ def test_view_transform_follows_rotate_and_mirror():
         assert to_view(uv, tr.view_transform()) == pytest.approx((p[0] / p[2], p[1] / p[2]), abs=1e-4)
 
 
-def test_pointer_log_picks_sample_nearest_sentence_start():
-    log = PointerLog()
-    for t, u in [(10.0, 0.1), (11.0, 0.2), (12.0, 0.3), (20.0, 0.9)]:
-        log.add(t, u, 0.5)
-    assert log.at(11.1, 13.0) == (0.2, 0.5)
-    assert log.at(15.5, 19.8) == (0.9, 0.5)        # finger arrived during the sentence
-    assert log.at(30.0, 31.0) is None              # finger never on the page
-    assert PointerLog().at(0, 1) is None
-
-
 def test_export_pdf_annotations(tmp_path):
     scan = np.full((594, 420, 3), 255, np.uint8)
     notes = [Note(1, "Fix this title.", time.time(), time.time() + 1, (0.25, 0.1)),
@@ -62,8 +52,13 @@ def test_export_pdf_annotations(tmp_path):
     page = pypdf.PdfReader(str(path)).pages[0]
     w, h = float(page.mediabox.width), float(page.mediabox.height)
     assert (w, h) == pytest.approx((595.3, 841.9), abs=1.5)        # A4 in points
-    annots = [a.get_object() for a in page["/Annots"]]
-    assert [a["/Subtype"] for a in annots] == ["/Text", "/Text"]
+    every = [a.get_object() for a in page["/Annots"]]
+    assert [a["/Subtype"] for a in every] == ["/Text", "/Popup", "/Text", "/Popup"]
+    annots = [a for a in every if a["/Subtype"] == "/Text"]
+    for a in annots:   # viewers like Preview need the linked popup + spec /F flags to show the text
+        assert a["/Popup"].get_object()["/Parent"].get_object() is a or \
+            a["/Popup"].get_object()["/Parent"].idnum == a.indirect_reference.idnum
+        assert a["/F"] & 4 and "/Flags" not in a
     assert annots[0]["/Contents"] == "Fix this title."
     x0, y0, x1, y1 = [float(v) for v in annots[0]["/Rect"]]
     assert ((x0 + x1) / 2, (y0 + y1) / 2) == pytest.approx((0.25 * w, 0.9 * h), abs=0.5)
@@ -108,13 +103,13 @@ def test_recording_pipeline_with_fake_mic_and_model(tmp_path, monkeypatch):
     vn._model.ready.set()
     vn.start()
     t0 = vn.recordings[0].transcript.session_start_epoch
-    vn.add_pointer(t0 + 0.2, (0.1, 0.2))
-    vn.add_pointer(t0 + 1.2, (0.7, 0.8))
+    for k in range(20):                          # held at one spot for 1 s, then at another
+        vn.add_pointer(t0 + 0.1 * k, (0.1, 0.2) if k < 10 else (0.7, 0.8))
     vn.stop()
     assert vn.wait(timeout=10)
     notes = vn.notes()
     assert [n.text for n in notes] == ["Hello there.", "Second one."]
-    assert [n.uv for n in notes] == [(0.1, 0.2), (0.7, 0.8)]
+    assert [n.uv for n in notes] == [pytest.approx((0.1, 0.2)), pytest.approx((0.7, 0.8))]
     assert (vn.session_dir / "rec_01" / "session.wav").stat().st_size > 2 * sr
     assert isinstance(vn.recordings[0], Recording)
 
@@ -140,28 +135,68 @@ def test_pick_pointer_label_is_only_a_priority_and_direction_is_ignored():
     assert pick_pointer([fake_hand("Right", (5, 5), pointing=False)], to_doc, any_pose=True)[2] == "ok"
 
 
-def notes_from(sentences, samples):
-    vn = VoiceNotes("/nonexistent")
-    vn.recordings = [SimpleNamespace(sentences=lambda: sentences)]
+def track(*legs, fps=10):
+    """Fingertip samples: legs of (t0, t1, (u, v)), with small jitter, None = finger off the page."""
+    rng = np.random.default_rng(0)
+    out = []
+    for t0, t1, uv in legs:
+        for t in np.arange(t0, t1, 1 / fps):
+            if uv is not None:
+                out.append((float(t), (uv[0] + rng.normal(0, 0.006), uv[1] + rng.normal(0, 0.006))))
+    return out
+
+
+def notes_from(words, samples, **kw):
+    """words: [(t, "word"), ...] spoken; samples: [(t, (u, v)), ...] fingertip."""
+    vn = VoiceNotes("/nonexistent", **kw)
+    vn.aspect = 1.0
+    vn.recordings = [SimpleNamespace(words=lambda: words, transcript=SimpleNamespace(sentences=[]))]
     for t, uv in samples:
         vn.pointer.add(t, *uv)
     return vn.notes()
 
 
-def test_sentence_without_finger_joins_the_last_comment():
-    notes = notes_from([(10, 12, "Look here."), (13, 15, "Still about it."), (20, 22, "New point.")],
-                       [(10.0, (0.2, 0.2)), (20.1, (0.8, 0.8))])
-    assert [(n.text, n.uv) for n in notes] == [("Look here. Still about it.", (0.2, 0.2)),
-                                             ("New point.", (0.8, 0.8))]
-    assert notes[0].end == 15
+def said(text, t0, dt=0.3):
+    return [(t0 + i * dt, w) for i, w in enumerate(text.split())]
 
 
-def test_finger_lifted_before_talking_starts_a_comment_at_its_last_spot():
-    # pointed at (0.7, 0.3) at t=16, lifted, then spoke at t=20 with no finger on the page
-    notes = notes_from([(10, 12, "First."), (20, 22, "Second.")], [(10.0, (0.1, 0.1)), (16.0, (0.7, 0.3))])
-    assert [(n.text, n.uv) for n in notes] == [("First.", (0.1, 0.1)), ("Second.", (0.7, 0.3))]
+def test_new_comment_starts_at_the_first_word_spoken_at_a_new_spot():
+    # ONE sentence while moving from the heading (0.2, 0.1) to a number (0.7, 0.6)
+    words = said("this heading is wrong and this number should be 2000", 10.0)   # 10.0 .. 12.7
+    notes = notes_from(words, track((9.5, 11.4, (0.2, 0.1)), (11.4, 11.6, (0.45, 0.35)),
+                                    (11.6, 14.0, (0.7, 0.6))))
+    assert [n.text for n in notes] == ["this heading is wrong and", "this number should be 2000"]
+    assert notes[0].uv == pytest.approx((0.2, 0.1), abs=0.01)
+    assert notes[1].uv == pytest.approx((0.7, 0.6), abs=0.01)
+
+
+def test_small_moves_and_jitter_stay_one_comment():
+    words = said("first remark here.", 1.0) + said("second remark same place.", 3.0)
+    # wanders within 3% of the page: below the 5% radius
+    notes = notes_from(words, track((0.5, 2.0, (0.50, 0.50)), (2.0, 3.0, (0.52, 0.51)),
+                                    (3.0, 5.0, (0.49, 0.52))))
+    assert len(notes) == 1 and notes[0].text == "first remark here. second remark same place."
+
+
+def test_passing_over_a_spot_without_stopping_is_not_an_anchor():
+    words = said("one two three four five six seven eight", 1.0)               # 1.0 .. 3.1
+    notes = notes_from(words, track((0.5, 1.9, (0.2, 0.2)), (1.9, 2.1, (0.5, 0.5)),  # 0.2 s: transit
+                                    (2.1, 4.0, (0.8, 0.8))))
+    assert [n.uv for n in notes] == [pytest.approx((0.2, 0.2), abs=0.01), pytest.approx((0.8, 0.8), abs=0.01)]
+
+
+def test_words_without_finger_stay_with_the_last_stop():
+    words = said("look here.", 1.0) + said("and also this, finger lifted.", 4.0)
+    notes = notes_from(words, track((0.5, 2.0, (0.3, 0.3))))
+    assert len(notes) == 1 and notes[0].uv == pytest.approx((0.3, 0.3), abs=0.01)
+
+
+def test_words_before_any_finger_are_one_unpinned_comment():
+    words = said("intro words.", 1.0) + said("now pointing.", 5.0)
+    notes = notes_from(words, track((5.0, 7.0, (0.6, 0.4))))
+    assert [(n.text, n.uv is None) for n in notes] == [("intro words.", True), ("now pointing.", False)]
 
 
 def test_no_finger_at_all_gives_one_unpinned_comment():
-    notes = notes_from([(1, 2, "A."), (3, 4, "B.")], [])
+    notes = notes_from(said("A. B.", 1.0), [])
     assert [(n.text, n.uv) for n in notes] == [("A. B.", None)]

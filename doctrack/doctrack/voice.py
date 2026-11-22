@@ -19,6 +19,7 @@ Output: voice_notes/<date_time>/
     notes_<time>.pdf, notes_<time>.json           one pair per export
 """
 
+import bisect
 import io
 from collections import Counter
 import json
@@ -27,7 +28,7 @@ import sys
 import threading
 import time
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Sequence, Tuple
@@ -64,24 +65,6 @@ class PointerLog:
         if self._file:
             self._file.write(json.dumps({"t": round(t, 3), "u": round(u, 4), "v": round(v, 4)}) + "\n")
 
-    def at(self, start: float, end: float, before: float = 1.0,
-           after: float = 0.5) -> Optional[Tuple[float, float]]:
-        """Where the finger was when a sentence spoken in [start, end] began: the sample
-        closest to `start`, looking from `before` s earlier to `after` s past the end."""
-        if not self.t:
-            return None
-        t = np.asarray(self.t)
-        ok = (t >= start - before) & (t <= end + after)
-        if not ok.any():
-            return None
-        i = np.flatnonzero(ok)[np.argmin(np.abs(t[ok] - start))]
-        return self.uv[i]
-
-    def last_before(self, t0: float) -> Optional[Tuple[float, Tuple[float, float]]]:
-        """(time, uv) of the last sample at or before t0, or None."""
-        i = int(np.searchsorted(np.asarray(self.t), t0, side="right")) - 1
-        return (self.t[i], self.uv[i]) if i >= 0 else None
-
     def close(self) -> None:
         if self._file:
             self._file.close()
@@ -109,6 +92,54 @@ def pick_pointer(hands, to_doc, hand: str = "Right", any_pose: bool = False):
         else:
             return uv, h, "ok"
     return None, None, reasons[0]
+
+
+@dataclass
+class Fixation:
+    """A place the fingertip stayed: from t0 on (until the next fixation), centred on `uv`."""
+    t0: float
+    uv: Tuple[float, float]
+    n: int                                   # samples in it
+
+
+def find_fixations(t: Sequence[float], uv: Sequence[Tuple[float, float]], radius: float = 0.05,
+                   hold: float = 0.4, aspect: float = 2 ** 0.5, max_gap: float = 0.5) -> List[Fixation]:
+    """Where the finger stopped, in time order.
+
+    A new fixation starts only when the fingertip moves more than `radius` (fraction of the
+    page width) away from the current one AND stays within `radius` of its new spot for `hold`
+    seconds (samples at most `max_gap` apart). Jitter and small moves stay in the current
+    fixation; passing over the page on the way somewhere doesn't create one. A fixation's
+    start is when the finger ARRIVED at the spot, not when the hold was confirmed. `aspect` =
+    page height / width, so distances are physical. The centre is the median of its samples.
+    """
+    def far(a, b):
+        return ((a[0] - b[0]) ** 2 + ((a[1] - b[1]) * aspect) ** 2) > radius ** 2
+
+    fixations, members = [], []            # members[i]: samples of fixations[i]
+    cur_mean = None                         # running mean of the current fixation
+    cand, cand_last = [], None              # samples of a possible new fixation
+    for ti, p in sorted(zip(t, uv), key=lambda s: s[0]):
+        if cur_mean is not None and not far(p, cur_mean):
+            members[-1].append(p)
+            k = len(members[-1])
+            cur_mean = (cur_mean[0] + (p[0] - cur_mean[0]) / k, cur_mean[1] + (p[1] - cur_mean[1]) / k)
+            cand = []
+            continue
+        if not cand or far(p, cand[0][1]) or ti - cand_last > max_gap:
+            cand = [(ti, p)]                 # (re)start a candidate at this spot
+        else:
+            cand.append((ti, p))
+        cand_last = ti
+        if ti - cand[0][0] >= hold:          # stayed long enough: it's a real stop
+            pts = [q for _, q in cand]
+            fixations.append(Fixation(cand[0][0], pts[0], len(pts)))
+            members.append(pts)
+            cur_mean = tuple(np.mean(pts, axis=0))
+            cand = []
+    for f, pts in zip(fixations, members):
+        f.uv, f.n = tuple(float(x) for x in np.median(pts, axis=0)), len(pts)
+    return fixations
 
 
 @dataclass
@@ -248,12 +279,13 @@ class Recording:
             self.transcript.add_words([], final=True)
         self.done.set()
 
-    def sentences(self) -> List[Tuple[float, float, str]]:
-        """(start epoch, end epoch, text) of the sentences transcribed so far."""
+    def words(self) -> List[Tuple[float, str]]:
+        """(start epoch, word) of every word transcribed so far, in order (word timestamps
+        from faster-whisper; the word keeps its punctuation)."""
         t0 = self.transcript.session_start_epoch
         if t0 is None:
             return []
-        return [(t0 + s["start"], t0 + s["end"], s["text"]) for s in list(self.transcript.sentences)]
+        return [(t0 + w["time"], w["word"]) for s in list(self.transcript.sentences) for w in s["words"]]
 
 
 # --------------------------------------------------------------------------- #
@@ -262,8 +294,12 @@ class Recording:
 
 class VoiceNotes:
     def __init__(self, out_root: Path, mic: Optional[str] = None, camera_mic: bool = False,
-                 chunk_s: float = 10.0) -> None:
+                 chunk_s: float = 10.0, radius: float = 0.05, hold: float = 0.4,
+                 lead: float = 0.3) -> None:
         self.out_root = Path(out_root)
+        self.radius, self.hold, self.lead = radius, hold, lead   # see notes()
+        self.aspect = 2 ** 0.5               # page height / width (lock frame), set by the app
+        self._cache = (None, 0.0, [])
         self._mic = SimpleNamespace(device=mic, camera=camera_mic)
         self._chunk_s = chunk_s
         self._model = _Model()
@@ -354,26 +390,41 @@ class VoiceNotes:
                 return False
         return True
 
-    def notes(self, after: float = 0.5) -> List[Note]:
-        """Comments, in speaking order. A sentence starts a new comment where the fingertip was
-        when it began (PointerLog.at). If the finger wasn't on the page then:
-        * finger not seen since the previous comment -> appended to that comment;
-        * finger seen since (e.g. pointed, then lifted before talking) -> new comment at the
-          last fingertip position."""
+    def fixations(self) -> List[Fixation]:
+        return find_fixations(self.pointer.t, self.pointer.uv, self.radius, self.hold, self.aspect)
+
+    def notes(self, max_age: float = 0.0) -> List[Note]:
+        """Comments, anchored at WORD level.
+
+        Every word is given to the finger stop (find_fixations) active when it was spoken: the
+        last stop that began before the word (or up to `lead` s after it, since you often start
+        talking just before the finger settles). Consecutive words on the same stop form one
+        comment, so a new comment starts exactly at the first word spoken at a new spot, and
+        small finger moves (< radius) never split a comment. Words with no fingertip on the
+        page stay with the last stop (the same comment as the last tracking point). Words before
+        any stop form an unpinned comment. `max_age` > 0 reuses a result up to that old (the
+        live status line calls this every frame)."""
+        key = (len(self.pointer.t), sum(len(r.transcript.sentences) for r in self.recordings),
+               self.radius, self.hold, self.aspect)
+        cached_key, cached_t, cached = self._cache
+        if key == cached_key or (max_age and time.time() - cached_t < max_age):
+            return [replace(n) for n in cached]
+        fixations = self.fixations()
+        starts = [f.t0 - self.lead for f in fixations]
+        words = sorted(w for rec in self.recordings for w in rec.words())
         out: List[Note] = []
-        for rec in self.recordings:
-            for start, end, text in rec.sentences():
-                uv = self.pointer.at(start, end)
-                if uv is None:
-                    last = self.pointer.last_before(start)
-                    prev = out[-1] if out else None
-                    if prev is not None and (last is None or last[0] <= prev.end + after):
-                        prev.text += " " + text
-                        prev.end = end
-                        continue
-                    uv = last[1] if last else None
-                out.append(Note(len(out) + 1, text, start, end, uv))
-        return out
+        current = object()                   # fixation index of the open comment
+        for tw, word in words:
+            i = bisect.bisect_right(starts, tw) - 1          # -1: before any stop
+            if out and i == current:
+                out[-1].text += " " + word
+                out[-1].end = tw
+            else:
+                uv = fixations[i].uv if i >= 0 else None
+                out.append(Note(len(out) + 1, word, tw, tw, uv))
+                current = i
+        self._cache = (key, time.time(), out)
+        return [replace(n) for n in out]
 
 
 # --------------------------------------------------------------------------- #
@@ -403,8 +454,6 @@ def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
     import cv2
     from PIL import Image
     from pypdf import PdfReader, PdfWriter
-    from pypdf.annotations import Text
-    from pypdf.generic import ArrayObject, FloatObject, NameObject, TextStringObject
 
     path = Path(path)
     h, w = scan_bgr.shape[:2]
@@ -419,11 +468,7 @@ def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
 
     if summary:     # summary comment in the top-right corner, opened by default
         x, y = 0.96 * pw, 0.97 * ph
-        annot = Text(rect=(x - 12, y - 12, x + 12, y + 12), text=summary, open=True)
-        annot[NameObject("/T")] = TextStringObject("Summary")
-        annot[NameObject("/Name")] = NameObject("/Key")
-        annot[NameObject("/C")] = ArrayObject([FloatObject(0.2), FloatObject(0.6), FloatObject(1.0)])
-        writer.add_annotation(page_number=0, annotation=annot)
+        _add_sticky(writer, (x, y), 12, summary, "Summary", "/Key", (0.2, 0.6, 1.0), (pw, ph), open_=True)
         writer.add_metadata({"/Subject": summary})
 
     records = []
@@ -438,12 +483,8 @@ def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
             unplaced += 1
             text = "(no pointer) " + text
         x, y = float(uv[0]) * pw, (1.0 - float(uv[1])) * ph   # PDF origin is bottom-left
-        s = 10.0
-        annot = Text(rect=(x - s, y - s, x + s, y + s), text=text, open=False)
-        annot[NameObject("/T")] = TextStringObject(f"Voice note {n.index} · {time.strftime('%H:%M:%S', time.localtime(n.start))}")
-        annot[NameObject("/Name")] = NameObject("/Comment")
-        annot[NameObject("/C")] = ArrayObject([FloatObject(1.0), FloatObject(0.8), FloatObject(0.0)])
-        writer.add_annotation(page_number=0, annotation=annot)
+        title = f"Voice note {n.index} · {time.strftime('%H:%M:%S', time.localtime(n.start))}"
+        _add_sticky(writer, (x, y), 10, text, title, "/Comment", (1.0, 0.8, 0.0), (pw, ph))
         records.append(n.to_dict(uv_view=None if n.uv is None else uv))
 
     with open(path, "wb") as f:
@@ -451,6 +492,39 @@ def export_pdf(scan_bgr: np.ndarray, notes: Sequence[Note], path: Path,
     path.with_suffix(".json").write_text(json.dumps(
         {"page_pt": [round(pw, 2), round(ph, 2)], "summary": summary, "notes": records}, indent=1, ensure_ascii=False))
     return path
+
+
+def _add_sticky(writer, xy, s, text, title, icon, color, page_wh, open_=False) -> None:
+    """Add a /Text (sticky note) annotation plus its linked /Popup to page 0.
+
+    pypdf's `Text` helper alone isn't enough for many viewers (macOS Preview,
+    browsers): they need the /Popup annotation to show the text, the flags under
+    the spec key /F (pypdf writes a non-standard /Flags), and /Type /Annot.
+    """
+    from pypdf.annotations import Popup, Text
+    from pypdf.generic import ArrayObject, FloatObject, NameObject, NumberObject, TextStringObject
+
+    x, y = xy
+    pw, ph = page_wh
+    annot = Text(rect=(x - s, y - s, x + s, y + s), text=text, open=open_)
+    annot.pop(NameObject("/Flags"), None)
+    annot[NameObject("/Type")] = NameObject("/Annot")
+    annot[NameObject("/F")] = NumberObject(4 | 8 | 16)          # Print | NoZoom | NoRotate
+    annot[NameObject("/T")] = TextStringObject(title)
+    annot[NameObject("/Name")] = NameObject(icon)
+    annot[NameObject("/C")] = ArrayObject([FloatObject(c) for c in color])
+    annot[NameObject("/M")] = TextStringObject(time.strftime("D:%Y%m%d%H%M%S"))
+    parent = writer.add_annotation(page_number=0, annotation=annot)
+
+    # popup window next to the icon, kept on the page
+    w, h = 220.0, 120.0
+    px0 = min(max(x + s, 0.0), max(pw - w, 0.0))
+    py1 = min(max(y + s, h), ph)
+    popup = Popup(rect=(px0, py1 - h, px0 + w, py1), parent=parent, open=open_)
+    popup[NameObject("/Type")] = NameObject("/Annot")
+    popup[NameObject("/F")] = NumberObject(4 | 8 | 16)
+    popup = writer.add_annotation(page_number=0, annotation=popup)
+    parent[NameObject("/Popup")] = popup.indirect_reference
 
 
 def to_view(uv: Tuple[float, float], view: Optional[np.ndarray]) -> Tuple[float, float]:
