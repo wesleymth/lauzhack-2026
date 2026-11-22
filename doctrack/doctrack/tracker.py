@@ -56,7 +56,8 @@ class DocumentTracker:
                  max_docs: int = 3, min_hits: int = 10, min_score: float = 0.6,
                  new_score: float = 0.45, match_iou: float = 0.3, max_misses: int = 30,
                  lock_backend: str = "auto") -> None:
-        """lock_backend: how a selected document is tracked. "docaligner" =
+        """lock_backend: how a selected document is tracked (this branch: the
+        docaligner / vision corners are snapped onto the page's real edges). "docaligner" =
         pretrained DocAligner corner model (onnxruntime), "vision" = Apple's
         document detector (macOS), "classic" = the OpenCV tracker, "auto" =
         docaligner when onnxruntime is available."""
